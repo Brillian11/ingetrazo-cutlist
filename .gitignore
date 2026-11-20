@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary debugging and scratch files
+r_img_dis.txt
+*.tmp
+*.log
+
+# Exported sample output
+*.png
+*.pdf
+*.csv
+
+# CAD files
+*.igz
+
+# Editor / IDE metadata
+.vscode/
+.idea/
+*.swp

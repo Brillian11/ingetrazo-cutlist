@@ -1,0 +1,6 @@
+{
+  "id": "ingetrazo_cutlist",
+  "name": "Cut List",
+  "version": "1.2.0",
+  "description": "OpenCutList-style cutting list and 2D drawing generator for IngeTrazo."
+}
