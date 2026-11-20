@@ -1,4 +1,4 @@
-# OpenCutList for IngeTrazo CAD (v1.5.1)
+# OpenCutList for IngeTrazo CAD (Beta 0.1)
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10+-3776ab.svg)](https://www.python.org/)

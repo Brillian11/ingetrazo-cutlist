@@ -166,7 +166,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 PLUGIN_KEY = "ingetrazo_cutlist"
 PLUGIN_TITLE = "Cut List"
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "Beta 0.1"
 PLUGIN_AUTHOR = "brillian11"
 PLUGIN_GITHUB = "https://github.com/brillian11"
 PLUGIN_AUDIENCE = "Woodworkers & Cabinet Makers"
@@ -2821,7 +2821,7 @@ if QT_AVAILABLE:
             cad_lbl.setStyleSheet("color: #94a3b8;")
             title_row.addWidget(cad_lbl)
 
-            ver_badge = QLabel(f" v{PLUGIN_VERSION} ")
+            ver_badge = QLabel(f" {PLUGIN_VERSION} ")
             ver_badge.setStyleSheet("""
                 background-color: #166534;
                 color: #86efac;
@@ -4246,7 +4246,7 @@ def show_about_dialog(parent: Optional[Any] = None) -> None:
         dlg = CutListAboutDialog(parent)
         dlg.exec()
     else:
-        print(f"=== OpenCutList for IngeTrazo v{PLUGIN_VERSION} ===")
+        print(f"=== OpenCutList for IngeTrazo ({PLUGIN_VERSION}) ===")
         print(f"Target Audience: {PLUGIN_AUDIENCE}")
         print("Dedicated cut list, 1D/2D nesting, and technical drawing suite for Woodworkers & Cabinet Makers.")
         print(f"Developer: {PLUGIN_AUTHOR} ({PLUGIN_GITHUB})")

@@ -435,6 +435,7 @@ class TestCutListPlugin(unittest.TestCase):
         """Verify developer attribution to brillian11 and audience for woodworkers & cabinet makers."""
         self.assertEqual(cp.PLUGIN_AUTHOR, "brillian11")
         self.assertEqual(cp.PLUGIN_GITHUB, "https://github.com/brillian11")
+        self.assertEqual(cp.PLUGIN_VERSION, "Beta 0.1")
         self.assertIn("Woodworker", cp.PLUGIN_AUDIENCE)
         self.assertIn("Cabinet Maker", cp.PLUGIN_AUDIENCE)
 

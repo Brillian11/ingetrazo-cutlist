@@ -1,6 +1,10 @@
 {
   "id": "ingetrazo_cutlist",
-  "name": "Cut List",
-  "version": "1.2.0",
-  "description": "OpenCutList-style cutting list and 2D drawing generator for IngeTrazo."
+  "name": "OpenCutList",
+  "version": "Beta 0.1",
+  "description": "Cut list, 1D/2D nesting optimization, and 3D exploded technical drawing suite for woodworkers & cabinet makers.",
+  "author": "brillian11",
+  "author_url": "https://github.com/Brillian11",
+  "homepage": "https://github.com/Brillian11/ingetrazo-cutlist",
+  "license": "GPL-3.0-or-later"
 }
