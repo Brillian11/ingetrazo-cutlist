@@ -3433,58 +3433,104 @@ if QT_AVAILABLE:
             self._cached_ndc = part_ndc
             self.update()
 
-        def render_drawing(self, painter: QPainter, target_rect: QRectF) -> None:
+        def render_drawing(self, painter: QPainter, target_rect: QRectF, is_export: bool = False) -> None:
             painter.setRenderHint(QPainter.Antialiasing)
-            painter.fillRect(target_rect, QColor("#222222"))
+            painter.setRenderHint(QPainter.TextAntialiasing)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
-            sheet_margin = 25.0
-            sheet_rect = QRectF(
-                target_rect.left() + sheet_margin,
-                target_rect.top() + sheet_margin,
-                target_rect.width() - (2 * sheet_margin),
-                target_rect.height() - (2 * sheet_margin),
-            )
+            # Auto-detect export mode if rendering at high resolution
+            if not is_export and (target_rect.width() >= 1600 or target_rect.height() >= 1200):
+                is_export = True
 
-            shadow_rect = QRectF(sheet_rect.left() + 4, sheet_rect.top() + 4, sheet_rect.width(), sheet_rect.height())
-            painter.fillRect(shadow_rect, QColor(0, 0, 0, 90))
+            ui_scale = max(1.0, min(target_rect.width() / 850.0, target_rect.height() / 550.0))
 
-            painter.fillRect(sheet_rect, QColor("#ffffff"))
-            painter.setPen(QPen(QColor("#333333"), 1.5))
-            painter.drawRect(sheet_rect)
+            if is_export:
+                # In export mode, the sheet fills target_rect with a clean architectural white sheet & double border
+                painter.fillRect(target_rect, QColor("#ffffff"))
+                sheet_margin = 15.0 * ui_scale
+                sheet_rect = QRectF(
+                    target_rect.left() + sheet_margin,
+                    target_rect.top() + sheet_margin,
+                    target_rect.width() - (2 * sheet_margin),
+                    target_rect.height() - (2 * sheet_margin),
+                )
+                painter.setPen(QPen(QColor("#0f172a"), max(1.8, 2.4 * ui_scale)))
+                painter.drawRect(sheet_rect)
 
-            inner_rect = QRectF(sheet_rect.left() + 8, sheet_rect.top() + 8, sheet_rect.width() - 16, sheet_rect.height() - 16)
-            painter.setPen(QPen(QColor("#777777"), 1))
-            painter.drawRect(inner_rect)
+                inner_gap = 4.0 * ui_scale
+                inner_rect = QRectF(
+                    sheet_rect.left() + inner_gap,
+                    sheet_rect.top() + inner_gap,
+                    sheet_rect.width() - (2 * inner_gap),
+                    sheet_rect.height() - (2 * inner_gap),
+                )
+                painter.setPen(QPen(QColor("#64748b"), max(1.0, 1.2 * ui_scale)))
+                painter.drawRect(inner_rect)
+            else:
+                # Interactive widget canvas with dark mode background and drop-shadowed paper sheet
+                painter.fillRect(target_rect, QColor("#222222"))
 
-            painter.setPen(QColor("#111111"))
+                sheet_margin = 20.0
+                sheet_rect = QRectF(
+                    target_rect.left() + sheet_margin,
+                    target_rect.top() + sheet_margin,
+                    target_rect.width() - (2 * sheet_margin),
+                    target_rect.height() - (2 * sheet_margin),
+                )
+
+                shadow_rect = QRectF(sheet_rect.left() + 4, sheet_rect.top() + 4, sheet_rect.width(), sheet_rect.height())
+                painter.fillRect(shadow_rect, QColor(0, 0, 0, 90))
+
+                painter.fillRect(sheet_rect, QColor("#ffffff"))
+                painter.setPen(QPen(QColor("#333333"), 1.5))
+                painter.drawRect(sheet_rect)
+
+                inner_rect = QRectF(sheet_rect.left() + 6, sheet_rect.top() + 6, sheet_rect.width() - 12, sheet_rect.height() - 12)
+                painter.setPen(QPen(QColor("#777777"), 1.0))
+                painter.drawRect(inner_rect)
+
+            title_h = 32.0 * ui_scale
+            title_pad_x = 16.0 * ui_scale
+            title_box = QRectF(inner_rect.left() + title_pad_x, inner_rect.top() + (8.0 * ui_scale), inner_rect.width() - (2 * title_pad_x), title_h)
+
             font_title = painter.font()
-            font_title.setPointSize(11)
+            font_title.setPointSize(max(11, int(round(12.5 * ui_scale))))
             font_title.setBold(True)
             painter.setFont(font_title)
-
-            title_box = QRectF(inner_rect.left() + 15, inner_rect.top() + 10, inner_rect.width() - 30, 24)
+            painter.setPen(QColor("#0f172a"))
             painter.drawText(title_box, Qt.AlignLeft | Qt.AlignVCenter, "INGETRAZO CUT LIST — ASSEMBLY DRAWING")
 
             font_meta = painter.font()
-            font_meta.setPointSize(8)
+            font_meta.setPointSize(max(8, int(round(9.5 * ui_scale))))
             font_meta.setBold(False)
             painter.setFont(font_meta)
+            painter.setPen(QColor("#475569"))
 
             meta_text = f"Exploded View  |  Parts: {len(self.parts)}  |  Units: {self.unit}  |  Explosion: {int(self.explode_factor * 100)}%"
             painter.drawText(title_box, Qt.AlignRight | Qt.AlignVCenter, meta_text)
 
-            painter.setPen(QPen(QColor("#bbbbbb"), 1))
-            painter.drawLine(inner_rect.left() + 15, inner_rect.top() + 36, inner_rect.right() - 15, inner_rect.top() + 36)
+            div_y = inner_rect.top() + (44.0 * ui_scale)
+            painter.setPen(QPen(QColor("#cbd5e1"), max(1.0, 1.5 * ui_scale)))
+            painter.drawLine(inner_rect.left() + title_pad_x, div_y, inner_rect.right() - title_pad_x, div_y)
 
             if not self.parts:
-                painter.setPen(QColor("#888888"))
+                painter.setFont(font_title)
+                painter.setPen(QColor("#94a3b8"))
                 painter.drawText(sheet_rect, Qt.AlignCenter, "No parts to display. Select objects in the viewport and click 'Generate'.")
                 return
 
-            draw_rect = QRectF(inner_rect.left() + 20, inner_rect.top() + 45, inner_rect.width() - 40, inner_rect.height() - 55)
+            draw_rect = QRectF(
+                inner_rect.left() + (12.0 * ui_scale),
+                div_y + (8.0 * ui_scale),
+                inner_rect.width() - (24.0 * ui_scale),
+                inner_rect.bottom() - div_y - (16.0 * ui_scale),
+            )
+
+            pan_x = self.pan_x * (ui_scale if is_export else 1.0)
+            pan_y = self.pan_y * (ui_scale if is_export else 1.0)
 
             if self._cached_image is not None and not self._cached_image.isNull():
-                target_img_rect = QRectF(draw_rect.left() + self.pan_x, draw_rect.top() + self.pan_y, draw_rect.width(), draw_rect.height())
+                target_img_rect = QRectF(draw_rect.left() + pan_x, draw_rect.top() + pan_y, draw_rect.width(), draw_rect.height())
                 painter.drawImage(target_img_rect, self._cached_image)
 
                 dw = target_img_rect.width()
@@ -3499,14 +3545,14 @@ if QT_AVAILABLE:
                     part_centers_2d.append((px, py, tag, name))
 
                 if self.show_callouts and part_centers_2d:
-                    self._draw_callout_balloons(painter, part_centers_2d, draw_rect)
+                    self._draw_callout_balloons(painter, part_centers_2d, draw_rect, ui_scale=ui_scale)
 
                 if self.show_legend and self.entries:
-                    self._draw_legend_table(painter, inner_rect)
+                    self._draw_legend_table(painter, inner_rect, ui_scale=ui_scale)
             else:
-                self._render_assembly_drawing_fallback(painter, draw_rect, inner_rect)
+                self._render_assembly_drawing_fallback(painter, draw_rect, inner_rect, ui_scale=ui_scale)
 
-        def _render_assembly_drawing_fallback(self, painter: QPainter, draw_rect: QRectF, inner_rect: QRectF) -> None:
+        def _render_assembly_drawing_fallback(self, painter: QPainter, draw_rect: QRectF, inner_rect: QRectF, ui_scale: float = 1.0) -> None:
             """High-precision 3D axonometric assembly renderer with true mesh faces,
             exact depth sorting, two-sided illumination, and outward exploded views.
             Operates purely via QPainter vector pipeline to ensure 100% viewport stability.
@@ -3524,8 +3570,8 @@ if QT_AVAILABLE:
 
             max_dim = max(all_max_x - all_min_x, all_max_y - all_min_y, all_max_z - all_min_z, 1.0)
 
-            center_x = draw_rect.center().x() + self.pan_x
-            center_y = draw_rect.center().y() + self.pan_y
+            center_x = draw_rect.center().x() + (self.pan_x * ui_scale)
+            center_y = draw_rect.center().y() + (self.pan_y * ui_scale)
 
             base_scale = (min(draw_rect.width(), draw_rect.height()) * 0.44) / (max_dim * (1.0 + (0.75 * self.explode_factor)))
             scale = base_scale * self.zoom
@@ -3663,7 +3709,7 @@ if QT_AVAILABLE:
             faces_to_render.sort(key=lambda f: f[0])
 
             # Crisp technical drawing pen for outlines and seams
-            edge_pen = QPen(QColor("#242424"), 1.2)
+            edge_pen = QPen(QColor("#242424"), max(1.0, 1.2 * ui_scale))
             edge_pen.setJoinStyle(Qt.RoundJoin)
 
             for _depth, pts, col in faces_to_render:
@@ -3674,22 +3720,22 @@ if QT_AVAILABLE:
 
             # Callout Balloons
             if self.show_callouts and part_centers_2d:
-                self._draw_callout_balloons(painter, part_centers_2d, draw_rect)
+                self._draw_callout_balloons(painter, part_centers_2d, draw_rect, ui_scale=ui_scale)
 
             # Parts Legend Table
             if self.show_legend and self.entries:
-                self._draw_legend_table(painter, inner_rect)
+                self._draw_legend_table(painter, inner_rect, ui_scale=ui_scale)
 
-        def _draw_callout_balloons(self, painter: QPainter, part_centers_2d: List[Tuple[float, float, str, str]], draw_rect: QRectF) -> None:
+        def _draw_callout_balloons(self, painter: QPainter, part_centers_2d: List[Tuple[float, float, str, str]], draw_rect: QRectF, ui_scale: float = 1.0) -> None:
             font_tag = painter.font()
-            font_tag.setPointSize(8)
+            font_tag.setPointSize(max(8, int(round(9.5 * ui_scale))))
             font_tag.setBold(True)
             painter.setFont(font_tag)
 
             drawn_tags = set()
-            balloon_radius = 11.0
-            center_x = draw_rect.center().x() + self.pan_x
-            center_y = draw_rect.center().y() + self.pan_y
+            balloon_radius = 12.5 * ui_scale
+            center_x = draw_rect.center().x() + (self.pan_x * ui_scale)
+            center_y = draw_rect.center().y() + (self.pan_y * ui_scale)
 
             for p2d_x, p2d_y, tag, name in part_centers_2d:
                 if not tag or tag in drawn_tags:
@@ -3699,79 +3745,145 @@ if QT_AVAILABLE:
                 dx = p2d_x - center_x
                 dy = p2d_y - center_y
                 dist = math.sqrt(dx*dx + dy*dy) or 1.0
-                offset_dist = 38.0
+                offset_dist = 48.0 * ui_scale
                 bx = p2d_x + (dx / dist) * offset_dist
                 by = p2d_y + (dy / dist) * offset_dist
 
-                painter.setPen(QPen(QColor("#555555"), 1.0, Qt.SolidLine))
+                # 1. Leader line
+                painter.setPen(QPen(QColor("#334155"), max(1.2, 1.8 * ui_scale), Qt.SolidLine))
                 painter.drawLine(QPointF(p2d_x, p2d_y), QPointF(bx, by))
 
-                painter.setBrush(QBrush(QColor("#333333")))
-                painter.drawEllipse(QPointF(p2d_x, p2d_y), 2.5, 2.5)
+                # 2. Origin anchor dot
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor("#0f172a")))
+                painter.drawEllipse(QPointF(p2d_x, p2d_y), 3.2 * ui_scale, 3.2 * ui_scale)
 
-                painter.setPen(QPen(QColor("#222222"), 1.5))
-                painter.setBrush(QBrush(QColor("#fff3b0")))
+                # 3. Balloon subtle drop shadow
+                painter.setBrush(QBrush(QColor(0, 0, 0, 40)))
+                painter.drawEllipse(QPointF(bx + (1.5 * ui_scale), by + (2.0 * ui_scale)), balloon_radius, balloon_radius)
+
+                # 4. Balloon circle
+                painter.setPen(QPen(QColor("#0f172a"), max(1.5, 2.2 * ui_scale)))
+                painter.setBrush(QBrush(QColor("#fef08a")))
                 painter.drawEllipse(QPointF(bx, by), balloon_radius, balloon_radius)
 
-                painter.setPen(QColor("#111111"))
+                # 5. Tag text
+                painter.setPen(QColor("#0f172a"))
                 painter.drawText(
                     QRectF(bx - balloon_radius, by - balloon_radius, 2 * balloon_radius, 2 * balloon_radius),
                     Qt.AlignCenter,
                     tag,
                 )
 
-        def _draw_legend_table(self, painter: QPainter, inner_rect: QRectF) -> None:
-            max_rows = min(6, len(self.entries))
-            row_h = 16.0
-            table_w = min(360.0, inner_rect.width() * 0.45)
-            table_h = 22.0 + (max_rows * row_h)
+        def _draw_legend_table(self, painter: QPainter, inner_rect: QRectF, ui_scale: float = 1.0) -> None:
+            header_h = 28.0 * ui_scale
+            row_h = 22.0 * ui_scale
+            max_table_h = inner_rect.height() * 0.45
+            available_rows = max(1, int((max_table_h - header_h) / row_h))
+            max_rows = min(len(self.entries), available_rows, 12 if ui_scale >= 1.8 else 6)
 
-            tx = inner_rect.left() + 15
-            ty = inner_rect.bottom() - table_h - 15
+            has_more = len(self.entries) > max_rows
+            footer_h = (18.0 * ui_scale) if has_more else 0.0
+            table_h = header_h + (max_rows * row_h) + footer_h
+            table_w = min(inner_rect.width() * 0.55, 480.0 * ui_scale)
+
+            tx = inner_rect.left() + (18.0 * ui_scale)
+            ty = inner_rect.bottom() - table_h - (18.0 * ui_scale)
 
             table_rect = QRectF(tx, ty, table_w, table_h)
 
-            painter.setPen(QPen(QColor("#444444"), 1))
-            painter.setBrush(QBrush(QColor(255, 255, 255, 230)))
+            # Drop shadow
+            shadow_rect = QRectF(tx + (2.5 * ui_scale), ty + (3.0 * ui_scale), table_w, table_h)
+            painter.fillRect(shadow_rect, QColor(0, 0, 0, 30))
+
+            # Table background & border
+            painter.setPen(QPen(QColor("#334155"), max(1.2, 1.8 * ui_scale)))
+            painter.setBrush(QBrush(QColor(255, 255, 255, 245)))
             painter.drawRect(table_rect)
 
-            header_rect = QRectF(tx, ty, table_w, 20)
-            painter.fillRect(header_rect, QColor("#e9ecef"))
-            painter.setPen(QColor("#212529"))
+            # Header background & border
+            header_rect = QRectF(tx, ty, table_w, header_h)
+            painter.fillRect(header_rect, QColor("#f1f5f9"))
+            painter.setPen(QPen(QColor("#cbd5e1"), max(1.0, 1.2 * ui_scale)))
+            painter.drawLine(tx, ty + header_h, tx + table_w, ty + header_h)
+
+            # Column geometry
+            col_tag_w = 46.0 * ui_scale
+            col_qty_w = 54.0 * ui_scale
+            col_dim_w = 148.0 * ui_scale
+            col_name_w = table_w - col_tag_w - col_qty_w - col_dim_w - (16.0 * ui_scale)
+
+            x_tag = tx + (8.0 * ui_scale)
+            x_name = x_tag + col_tag_w
+            x_qty = x_name + col_name_w
+            x_dim = x_qty + col_qty_w
 
             font_t = painter.font()
-            font_t.setPointSize(8)
+            font_t.setPointSize(max(8, int(round(10.0 * ui_scale))))
             font_t.setBold(True)
             painter.setFont(font_t)
+            painter.setPen(QColor("#0f172a"))
 
-            painter.drawText(QRectF(tx + 4, ty, 30, 20), Qt.AlignLeft | Qt.AlignVCenter, "Tag")
-            painter.drawText(QRectF(tx + 36, ty, 150, 20), Qt.AlignLeft | Qt.AlignVCenter, "Part Name")
-            painter.drawText(QRectF(tx + 190, ty, 35, 20), Qt.AlignCenter, "Qty")
-            painter.drawText(QRectF(tx + 230, ty, table_w - 235, 20), Qt.AlignRight | Qt.AlignVCenter, f"Dim ({self.unit})")
+            painter.drawText(QRectF(x_tag, ty, col_tag_w, header_h), Qt.AlignLeft | Qt.AlignVCenter, "Tag")
+            painter.drawText(QRectF(x_name, ty, col_name_w, header_h), Qt.AlignLeft | Qt.AlignVCenter, "Part Name")
+            painter.drawText(QRectF(x_qty, ty, col_qty_w, header_h), Qt.AlignCenter | Qt.AlignVCenter, "Qty")
+            painter.drawText(QRectF(x_dim, ty, col_dim_w - (8.0 * ui_scale), header_h), Qt.AlignRight | Qt.AlignVCenter, f"Dim ({self.unit})")
 
             font_r = painter.font()
+            font_r.setPointSize(max(8, int(round(9.0 * ui_scale))))
             font_r.setBold(False)
-            painter.setFont(font_r)
+
+            font_bold = painter.font()
+            font_bold.setPointSize(max(8, int(round(9.5 * ui_scale))))
+            font_bold.setBold(True)
+
+            fm = painter.fontMetrics()
 
             for idx in range(max_rows):
                 e = self.entries[idx]
-                ry = ty + 20 + (idx * row_h)
+                ry = ty + header_h + (idx * row_h)
+                row_rect = QRectF(tx, ry, table_w, row_h)
 
                 if idx % 2 == 1:
-                    painter.fillRect(QRectF(tx, ry, table_w, row_h), QColor("#f8f9fa"))
+                    painter.fillRect(row_rect, QColor("#f8fafc"))
 
-                painter.setPen(QColor("#222222"))
-                painter.drawText(QRectF(tx + 4, ry, 30, row_h), Qt.AlignLeft | Qt.AlignVCenter, f"({e.tag})")
-                disp = e.display_name if len(e.display_name) <= 20 else (e.display_name[:17] + "...")
-                painter.drawText(QRectF(tx + 36, ry, 150, row_h), Qt.AlignLeft | Qt.AlignVCenter, disp)
-                painter.drawText(QRectF(tx + 190, ry, 35, row_h), Qt.AlignCenter, str(e.count))
+                painter.setPen(QPen(QColor("#f1f5f9"), max(0.8, 1.0 * ui_scale)))
+                painter.drawLine(tx, ry + row_h, tx + table_w, ry + row_h)
 
+                # Tag in bold primary blue
+                painter.setFont(font_bold)
+                painter.setPen(QColor("#2563eb"))
+                painter.drawText(QRectF(x_tag, ry, col_tag_w, row_h), Qt.AlignLeft | Qt.AlignVCenter, f"({e.tag})")
+
+                # Part name elided cleanly
+                painter.setFont(font_r)
+                painter.setPen(QColor("#1e293b"))
+                disp = fm.elidedText(e.display_name, Qt.ElideRight, int(col_name_w - (6.0 * ui_scale)))
+                painter.drawText(QRectF(x_name, ry, col_name_w, row_h), Qt.AlignLeft | Qt.AlignVCenter, disp)
+
+                # Qty centered
+                painter.setFont(font_bold)
+                painter.setPen(QColor("#0f172a"))
+                painter.drawText(QRectF(x_qty, ry, col_qty_w, row_h), Qt.AlignCenter | Qt.AlignVCenter, str(e.count))
+
+                # Dimensions
+                painter.setFont(font_r)
+                painter.setPen(QColor("#475569"))
                 dim_str = f"{format_dimension(e.length, self.unit)}×{format_dimension(e.width, self.unit)}"
-                painter.drawText(QRectF(tx + 230, ry, table_w - 235, row_h), Qt.AlignRight | Qt.AlignVCenter, dim_str)
+                painter.drawText(QRectF(x_dim, ry, col_dim_w - (8.0 * ui_scale), row_h), Qt.AlignRight | Qt.AlignVCenter, dim_str)
+
+            if has_more:
+                fy = ty + header_h + (max_rows * row_h)
+                painter.setPen(QPen(QColor("#cbd5e1"), max(0.8, 1.0 * ui_scale)))
+                painter.drawLine(tx, fy, tx + table_w, fy)
+                painter.setFont(font_r)
+                painter.setPen(QColor("#64748b"))
+                rem_text = f"+ {len(self.entries) - max_rows} additional parts in assembly"
+                painter.drawText(QRectF(x_tag, fy, table_w - (16.0 * ui_scale), footer_h), Qt.AlignLeft | Qt.AlignVCenter, rem_text)
 
         def paintEvent(self, event: Any) -> None:
             painter = QPainter(self)
-            self.render_drawing(painter, QRectF(self.rect()))
+            self.render_drawing(painter, QRectF(self.rect()), is_export=False)
             painter.end()
 
 
@@ -6177,7 +6289,7 @@ if QT_AVAILABLE:
                 pix = QPixmap(w, h)
                 pix.fill(Qt.transparent)
                 p = QPainter(pix)
-                self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h))
+                self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h), is_export=True)
                 p.end()
                 pix.save(path, "PNG")
                 QMessageBox.information(self, "Complete", f"Exploded drawing exported to:\n{path}")
@@ -6195,14 +6307,14 @@ if QT_AVAILABLE:
                     pdf.setPageOrientation(QPageLayout.Landscape)
                     p = QPainter(pdf)
                     target = QRectF(0, 0, pdf.width(), pdf.height())
-                    self.drawing_widget.render_drawing(p, target)
+                    self.drawing_widget.render_drawing(p, target, is_export=True)
                     p.end()
                     QMessageBox.information(self, "Complete", f"Exploded drawing PDF exported to:\n{path}")
                 except Exception:
                     w, h = 2400, 1600
                     pix = QPixmap(w, h)
                     p = QPainter(pix)
-                    self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h))
+                    self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h), is_export=True)
                     p.end()
                     pix.save(path, "PDF")
                     QMessageBox.information(self, "Complete", f"Exploded drawing PDF saved to:\n{path}")
@@ -6229,7 +6341,7 @@ if QT_AVAILABLE:
                 pix = QPixmap(w, h)
                 pix.fill(Qt.transparent)
                 p = QPainter(pix)
-                self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h))
+                self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h), is_export=True)
                 p.end()
                 pix.save(path, "PNG")
 

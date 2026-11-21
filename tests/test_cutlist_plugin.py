@@ -776,6 +776,28 @@ class TestCutListPlugin(unittest.TestCase):
         if cp.QT_AVAILABLE:
             self.assertTrue(hasattr(cp.CutListWindow, "_export_to_composer"))
 
+    def test_exploded_drawing_text_visibility_and_scaling(self):
+        """Verify dynamic resolution scaling for text, balloons, and legend on exploded drawing."""
+        plugin_path = Path(__file__).parent.parent / "cutlist_plugin.py"
+        with open(plugin_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Check render_drawing signature and scaling logic
+        self.assertIn("def render_drawing(self, painter: QPainter, target_rect: QRectF, is_export: bool = False)", src)
+        self.assertIn("ui_scale = max(1.0, min(target_rect.width() / 850.0, target_rect.height() / 550.0))", src)
+
+        # Check export mode uses pure white background and engineering double border
+        self.assertIn("painter.fillRect(target_rect, QColor(\"#ffffff\"))", src)
+
+        # Check callout balloons dynamic scaling
+        self.assertIn("balloon_radius = 12.5 * ui_scale", src)
+        self.assertIn("offset_dist = 48.0 * ui_scale", src)
+
+        # Check legend table dynamic scaling and elidedText
+        self.assertIn("fm.elidedText(e.display_name, Qt.ElideRight", src)
+        self.assertIn("table_w = min(inner_rect.width() * 0.55, 480.0 * ui_scale)", src)
+        self.assertIn("is_export=True", src)
+
 
 if __name__ == "__main__":
     unittest.main()
