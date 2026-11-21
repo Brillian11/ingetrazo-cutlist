@@ -1750,6 +1750,103 @@ def extract_parts_from_groups(groups: List[Any]) -> List[RawPart]:
     return parts
 
 
+def compute_assembly_explosion_offsets(
+    parts: List[RawPart],
+    explode_factor: float,
+) -> Dict[int, Tuple[float, float, float]]:
+    """Compute outward 3D explosion displacement offsets for each assembly part.
+
+    Uses an intelligent woodworking & mechanical assembly layout algorithm:
+    - Side uprights/stiles displace outward laterally along the X axis.
+    - Back panels displace backward along the -Y axis.
+    - Horizontal shelves & dividers displace vertically along Z AND pull forward along +Y,
+      ensuring they clearly separate from the carcase rather than staying hidden inside.
+    - Arched crowns, pediments, and top mouldings displace upward (+Z) and forward (+Y).
+    - Other components displace along outward radial unit vectors.
+    - If parts are perfectly centered (e.g. shelves at cx = mid_x), they are given clear
+      directional separation so the exploded view is always dynamic, clear, and visible.
+    """
+    offsets: Dict[int, Tuple[float, float, float]] = {}
+    if not parts:
+        return offsets
+
+    if explode_factor <= 0.0:
+        for p in parts:
+            offsets[id(p)] = (0.0, 0.0, 0.0)
+        return offsets
+
+    all_min_x = min(p.min_x for p in parts)
+    all_max_x = max(p.max_x for p in parts)
+    all_min_y = min(p.min_y for p in parts)
+    all_max_y = max(p.max_y for p in parts)
+    all_min_z = min(p.min_z for p in parts)
+    all_max_z = max(p.max_z for p in parts)
+
+    mid_x = (all_min_x + all_max_x) / 2.0
+    mid_y = (all_min_y + all_max_y) / 2.0
+    mid_z = (all_min_z + all_max_z) / 2.0
+
+    span_x = max(all_max_x - all_min_x, 1.0)
+    span_y = max(all_max_y - all_min_y, 1.0)
+    span_z = max(all_max_z - all_min_z, 1.0)
+    max_dim = max(span_x, span_y, span_z)
+
+    # Base separation distance scales with slider factor (0.0 to 2.5)
+    scale_dist = max_dim * 0.38 * explode_factor
+
+    for p_idx, p in enumerate(parts):
+        cx, cy, cz = p.center
+        dx = cx - mid_x
+        dy = cy - mid_y
+        dz = cz - mid_z
+
+        sx = max(p.max_x - p.min_x, 0.01)
+        sy = max(p.max_y - p.min_y, 0.01)
+        sz = max(p.max_z - p.min_z, 0.01)
+
+        # Determine the thin axis (thickness / normal of panel or board)
+        dims = sorted([(sx, 'x'), (sy, 'y'), (sz, 'z')], key=lambda t: t[0])
+        normal_axis = dims[0][1]
+
+        # Radial unit direction from assembly center
+        dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dist_3d > 1e-3:
+            nx = dx / dist_3d
+            ny = dy / dist_3d
+            nz = dz / dist_3d
+        else:
+            nx, ny, nz = 0.0, 1.0, 0.0
+
+        # Base proportional displacement
+        vx = dx * explode_factor + nx * (scale_dist * 0.45)
+        vy = dy * explode_factor + ny * (scale_dist * 0.45)
+        vz = dz * explode_factor + nz * (scale_dist * 0.45)
+
+        # Smart furniture & cabinet heuristics for centered or planar parts:
+        if normal_axis == 'x':
+            # Side panels / stiles: push outward along X
+            dir_x = 1.0 if cx >= mid_x else -1.0
+            vx = dx * explode_factor + dir_x * scale_dist
+        elif normal_axis == 'y':
+            # Back panels, doors, face frames: push along Y
+            dir_y = -1.0 if cy <= mid_y else 1.0
+            vy = dy * explode_factor + dir_y * (scale_dist * 1.1)
+        elif normal_axis == 'z':
+            # Horizontal shelves & bottom/top plates:
+            # Push forward along +Y so they slide out of the carcase, and separate vertically
+            vy += scale_dist * 0.85
+            dir_z = 1.0 if dz >= 0 else -1.0
+            vz = dz * explode_factor + dir_z * (scale_dist * 0.5)
+        elif cz > mid_z + (span_z * 0.25):
+            # Arched top crowns, pediments, pediment trim: push upward (+Z) and forward (+Y)
+            vz += scale_dist * 0.75
+            vy += scale_dist * 0.45
+
+        offsets[id(p)] = (vx, vy, vz)
+
+    return offsets
+
+
 def group_parts(
     parts: List[RawPart],
     merge_by_dimensions: bool = True,
@@ -3140,7 +3237,10 @@ if QT_AVAILABLE:
 
         def set_explode_factor(self, factor: float) -> None:
             self.explode_factor = max(0.0, factor)
-            self.schedule_3d_render(delay_ms=25, full_res=False, refresh_cad=False)
+            if self.outline_mode:
+                self.update()
+            else:
+                self.schedule_3d_render(delay_ms=20, full_res=False, refresh_cad=False)
 
         def set_view_angles(self, yaw_deg: float, pitch_deg: float) -> None:
             self.rot_z = math.radians(yaw_deg)
@@ -3253,6 +3353,7 @@ if QT_AVAILABLE:
 
             # 2. Save original group xforms & explode_offsets & apply explosion
             saved_xforms: List[Tuple[Any, Any, Any, Any]] = []
+            offsets = compute_assembly_explosion_offsets(self.parts, self.explode_factor)
             for part in self.parts:
                 grp = part.group_ref
                 if grp is not None:
@@ -3262,10 +3363,7 @@ if QT_AVAILABLE:
                     saved_xforms.append((grp, old_xf, old_off, was_comp))
 
                     if self.explode_factor > 0:
-                        cx, cy, cz = part.center
-                        dx = (cx - mid_x) * self.explode_factor
-                        dy = (cy - mid_y) * self.explode_factor
-                        dz = (cz - mid_z) * self.explode_factor
+                        dx, dy, dz = offsets.get(id(part), (0.0, 0.0, 0.0))
 
                         # Map world delta to local coordinate frame if inside a parent container
                         parent = parent_map.get(id(grp))
@@ -3354,19 +3452,21 @@ if QT_AVAILABLE:
                 cam.aspect = target_w / max(1, target_h)
 
                 # Fit bounding box taking explosion into account
-                exp_factor = 1.0 + self.explode_factor
-                min_exp_x = mid_x + (all_min_x - mid_x) * exp_factor
-                max_exp_x = mid_x + (all_max_x - mid_x) * exp_factor
-                min_exp_y = mid_y + (all_min_y - mid_y) * exp_factor
-                max_exp_y = mid_y + (all_max_y - mid_y) * exp_factor
-                min_exp_z = mid_z + (all_min_z - mid_z) * exp_factor
-                max_exp_z = mid_z + (all_max_z - mid_z) * exp_factor
-
-                min_v = QVector3D(min(min_exp_x, max_exp_x), min(min_exp_y, max_exp_y), min(min_exp_z, max_exp_z))
-                max_v = QVector3D(max(min_exp_x, max_exp_x), max(min_exp_y, max_exp_y), max(min_exp_z, max_exp_z))
+                if self.explode_factor > 0:
+                    min_exp_x = min(p.min_x + offsets.get(id(p), (0.0, 0.0, 0.0))[0] for p in self.parts)
+                    max_exp_x = max(p.max_x + offsets.get(id(p), (0.0, 0.0, 0.0))[0] for p in self.parts)
+                    min_exp_y = min(p.min_y + offsets.get(id(p), (0.0, 0.0, 0.0))[1] for p in self.parts)
+                    max_exp_y = max(p.max_y + offsets.get(id(p), (0.0, 0.0, 0.0))[1] for p in self.parts)
+                    min_exp_z = min(p.min_z + offsets.get(id(p), (0.0, 0.0, 0.0))[2] for p in self.parts)
+                    max_exp_z = max(p.max_z + offsets.get(id(p), (0.0, 0.0, 0.0))[2] for p in self.parts)
+                    min_v = QVector3D(min_exp_x, min_exp_y, min_exp_z)
+                    max_v = QVector3D(max_exp_x, max_exp_y, max_exp_z)
+                else:
+                    min_v = QVector3D(all_min_x, all_min_y, all_min_z)
+                    max_v = QVector3D(all_max_x, all_max_y, all_max_z)
 
                 if hasattr(cam, "fit_box"):
-                    cam.fit_box(min_v, max_v, margin=1.25)
+                    cam.fit_box(min_v, max_v, margin=1.20)
                 if self.zoom != 1.0:
                     cam.distance = max(0.1, cam.distance / self.zoom)
 
@@ -3386,9 +3486,10 @@ if QT_AVAILABLE:
                 for part in self.parts:
                     cx, cy, cz = part.center
                     if self.explode_factor > 0:
-                        cx += (cx - mid_x) * self.explode_factor
-                        cy += (cy - mid_y) * self.explode_factor
-                        cz += (cz - mid_z) * self.explode_factor
+                        ox, oy, oz = offsets.get(id(part), (0.0, 0.0, 0.0))
+                        cx += ox
+                        cy += oy
+                        cz += oz
                     clip = mvp.map(QVector4D(cx, cy, cz, 1.0))
                     if clip.w() != 0:
                         ndc_x = clip.x() / clip.w()
@@ -3507,7 +3608,10 @@ if QT_AVAILABLE:
             painter.setFont(font_meta)
             painter.setPen(QColor("#475569"))
 
-            view_mode_name = "Outline" if self.outline_mode else "Exploded" if self.explode_factor > 0 else "Assembly"
+            if self.explode_factor > 0:
+                view_mode_name = "Outline Exploded" if self.outline_mode else "Exploded"
+            else:
+                view_mode_name = "Outline Assembly" if self.outline_mode else "Assembly"
             meta_text = f"{view_mode_name} View  |  Parts: {len(self.parts)}  |  Units: {self.unit}  |  Explosion: {int(self.explode_factor * 100)}%"
             painter.drawText(title_box, Qt.AlignRight | Qt.AlignVCenter, meta_text)
 
@@ -3575,7 +3679,8 @@ if QT_AVAILABLE:
             center_x = draw_rect.center().x() + (self.pan_x * ui_scale)
             center_y = draw_rect.center().y() + (self.pan_y * ui_scale)
 
-            base_scale = (min(draw_rect.width(), draw_rect.height()) * 0.44) / (max_dim * (1.0 + (0.75 * self.explode_factor)))
+            exp_zoom_fit = 1.0 + (0.28 * self.explode_factor)
+            base_scale = (min(draw_rect.width(), draw_rect.height()) * 0.44) / (max_dim * exp_zoom_fit)
             scale = base_scale * self.zoom
 
             # Orthonormal camera coordinate system matching IngeTrazo OrbitCamera conventions
@@ -3619,13 +3724,12 @@ if QT_AVAILABLE:
 
             faces_to_render = []
             part_centers_2d: List[Tuple[float, float, str, str]] = []
+            offsets = compute_assembly_explosion_offsets(self.parts, self.explode_factor)
 
             for p_idx, part in enumerate(self.parts):
                 cx, cy, cz = part.center
-                # 3D explosion vector: moves outward from center of assembly
-                vx = (cx - mid_x) * self.explode_factor
-                vy = (cy - mid_y) * self.explode_factor
-                vz = (cz - mid_z) * self.explode_factor
+                # 3D explosion vector: smart outward dispersion
+                vx, vy, vz = offsets.get(id(part), (0.0, 0.0, 0.0))
 
                 pc_x = (cx - mid_x) + vx
                 pc_y = (cy - mid_y) + vy
@@ -3895,6 +3999,427 @@ if QT_AVAILABLE:
             painter = QPainter(self)
             self.render_drawing(painter, QRectF(self.rect()), is_export=False)
             painter.end()
+
+
+    def export_assembly_drawing_png(drawing_widget: Any, parent: QWidget, viewport: Any = None) -> None:
+        """Export high-resolution exploded technical drawing as a PNG image."""
+        doc_name = get_project_name(viewport)
+        clean_name = re.sub(r'[^\w\-_\.]', '_', doc_name) if doc_name else "exploded_assembly"
+        path, _ = QFileDialog.getSaveFileName(
+            parent,
+            "Export Exploded Drawing (PNG)",
+            f"{clean_name}_exploded_drawing.png",
+            "PNG Images (*.png)"
+        )
+        if not path:
+            return
+        try:
+            w, h = 2400, 1600
+            pix = QPixmap(w, h)
+            pix.fill(Qt.transparent)
+            p = QPainter(pix)
+            drawing_widget.render_drawing(p, QRectF(0, 0, w, h), is_export=True)
+            p.end()
+            pix.save(path, "PNG")
+            QMessageBox.information(parent, "Export Complete", f"Exploded drawing saved to:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(parent, "Error", f"Failed to export drawing PNG:\n{e}")
+
+
+    def export_assembly_drawing_pdf(drawing_widget: Any, parent: QWidget, viewport: Any = None) -> None:
+        """Export high-resolution exploded technical drawing sheet as a PDF document."""
+        doc_name = get_project_name(viewport)
+        clean_name = re.sub(r'[^\w\-_\.]', '_', doc_name) if doc_name else "exploded_assembly"
+        path, _ = QFileDialog.getSaveFileName(
+            parent,
+            "Export Exploded Drawing Sheet (PDF)",
+            f"{clean_name}_exploded_drawing.pdf",
+            "PDF Documents (*.pdf)"
+        )
+        if not path:
+            return
+        try:
+            try:
+                pdf = QPdfWriter(path)
+                pdf.setPageSize(QPageSize(QPageSize.A4))
+                pdf.setPageOrientation(QPageLayout.Landscape)
+                p = QPainter(pdf)
+                target = QRectF(0, 0, pdf.width(), pdf.height())
+                drawing_widget.render_drawing(p, target, is_export=True)
+                p.end()
+                QMessageBox.information(parent, "Complete", f"Exploded drawing PDF exported to:\n{path}")
+            except Exception:
+                w, h = 2400, 1600
+                pix = QPixmap(w, h)
+                p = QPainter(pix)
+                drawing_widget.render_drawing(p, QRectF(0, 0, w, h), is_export=True)
+                p.end()
+                pix.save(path, "PDF")
+                QMessageBox.information(parent, "Complete", f"Exploded drawing PDF saved to:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(parent, "Error", f"Failed to export PDF:\n{e}")
+
+
+    def export_assembly_drawing_to_composer(drawing_widget: Any, parent: QWidget, viewport: Any = None) -> None:
+        """Export high-resolution exploded drawing directly into IngeTrazo Sheet Composer."""
+        try:
+            appdata = os.environ.get("APPDATA")
+            if appdata:
+                drawings_dir = Path(appdata) / "IngeTrazo" / "drawings"
+            else:
+                drawings_dir = Path.home() / ".ingetrazo" / "drawings"
+            drawings_dir.mkdir(parents=True, exist_ok=True)
+
+            doc_name = get_project_name(viewport)
+            clean_name = re.sub(r'[^\w\-_\.]', '_', doc_name) if doc_name else "exploded_assembly"
+            path = str(drawings_dir / f"{clean_name}_exploded_drawing.png")
+
+            w, h = 2400, 1600
+            pix = QPixmap(w, h)
+            pix.fill(Qt.transparent)
+            p = QPainter(pix)
+            drawing_widget.render_drawing(p, QRectF(0, 0, w, h), is_export=True)
+            p.end()
+            pix.save(path, "PNG")
+
+            main_win = None
+            if viewport is not None:
+                if hasattr(viewport, "window"):
+                    main_win = viewport.window()
+                if not main_win and hasattr(viewport, "parent") and viewport.parent():
+                    p_widget = viewport.parent()
+                    if hasattr(p_widget, "window"):
+                        main_win = p_widget.window()
+
+            if not main_win and QT_AVAILABLE:
+                for widget in QApplication.topLevelWidgets():
+                    if widget.__class__.__name__ == "MainWindow" or hasattr(widget, "_ensure_composer") or hasattr(widget, "_on_open_composer"):
+                        main_win = widget
+                        break
+
+            composer = None
+            if main_win is not None:
+                if hasattr(main_win, "_ensure_composer"):
+                    composer = main_win._ensure_composer()
+                elif hasattr(main_win, "_composer"):
+                    composer = main_win._composer
+                elif hasattr(main_win, "_on_open_composer"):
+                    main_win._on_open_composer()
+                    composer = getattr(main_win, "_composer", None)
+
+            inserted = False
+            if composer is not None:
+                try:
+                    scene = getattr(composer, "_scene", None) or getattr(viewport, "scene", None)
+                    comps = getattr(scene, "compositions", []) if scene else []
+                    if not getattr(composer, "comp", None) or len(comps) == 0:
+                        if hasattr(composer, "_on_comp_add"):
+                            composer._on_comp_add()
+
+                    pw, ph = (297.0, 210.0)
+                    if hasattr(composer, "comp") and composer.comp:
+                        if hasattr(composer.comp, "page_size_mm"):
+                            pw, ph = composer.comp.page_size_mm()
+                        m_raw = getattr(composer.comp, "margin_mm", 10.0)
+                        m = float(m_raw) if isinstance(m_raw, (int, float)) else 10.0
+                    else:
+                        m = 10.0
+
+                    avail_w = max(50.0, pw - 2.0 * m)
+                    avail_h = max(50.0, ph - 2.0 * m)
+                    target_w = avail_w
+                    target_h = target_w / 1.5
+                    if target_h > avail_h:
+                        target_h = avail_h
+                        target_w = target_h * 1.5
+
+                    x_mm = m + (avail_w - target_w) / 2.0
+                    y_mm = m + (avail_h - target_h) / 2.0
+                    z_val = composer._next_z() if hasattr(composer, "_next_z") else 1
+
+                    try:
+                        from core.composition import ImagenItem, AddItemCommand
+                        item = ImagenItem(
+                            x_mm=float(x_mm),
+                            y_mm=float(y_mm),
+                            w_mm=float(target_w),
+                            h_mm=float(target_h),
+                            path=path,
+                            z=z_val
+                        )
+                        if hasattr(composer, "history") and hasattr(composer.history, "execute"):
+                            composer.history.execute(AddItemCommand(composer.comp, item))
+                            inserted = True
+                        elif hasattr(composer.comp, "images"):
+                            composer.comp.images.append(item)
+                            inserted = True
+                    except Exception as import_err:
+                        import sys
+                        ccomp = sys.modules.get("core.composition")
+                        if ccomp and hasattr(ccomp, "ImagenItem"):
+                            item = ccomp.ImagenItem(
+                                x_mm=float(x_mm),
+                                y_mm=float(y_mm),
+                                w_mm=float(target_w),
+                                h_mm=float(target_h),
+                                path=path,
+                                z=z_val
+                            )
+                            if hasattr(composer.comp, "images"):
+                                composer.comp.images.append(item)
+                                inserted = True
+
+                    if hasattr(composer, "_rebuild_canvas"):
+                        composer._rebuild_canvas()
+                    if hasattr(composer, "zoom_fit_page"):
+                        composer.zoom_fit_page()
+
+                except Exception as err:
+                    sys.stderr.write(f"[CutList] Error adding item to composer: {err}\n")
+
+            if composer is not None:
+                try:
+                    from views.composer import bring_to_front
+                    bring_to_front(composer)
+                except Exception:
+                    if hasattr(composer, "show"):
+                        composer.show()
+                    if hasattr(composer, "raise_"):
+                        composer.raise_()
+                    if hasattr(composer, "activateWindow"):
+                        composer.activateWindow()
+
+                reply = QMessageBox.question(
+                    parent,
+                    "IngeTrazo Sheet Composer",
+                    "Exploded assembly drawing has been placed onto the Sheet Composer!\n\n"
+                    "Switch to IngeTrazo Composer now?\n\n"
+                    "(Click 'Yes' to open Composer and start composing your sheet, or 'No' to stay in Drawing window).",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes and hasattr(parent, "accept"):
+                    parent.accept()
+            else:
+                save_path, _ = QFileDialog.getSaveFileName(
+                    parent,
+                    "Save Exploded Drawing Image",
+                    f"{clean_name}_exploded_drawing.png",
+                    "PNG Images (*.png)"
+                )
+                if save_path:
+                    pix.save(save_path, "PNG")
+                    QMessageBox.information(
+                        parent,
+                        "Export Complete",
+                        f"Exploded drawing saved to:\n{save_path}\n\nYou can insert this drawing into IngeTrazo Composer via Insert ▸ Image."
+                    )
+        except Exception as e:
+            QMessageBox.critical(parent, "Error", f"Failed to export drawing to IngeTrazo Composer:\n{e}")
+
+
+    class ExplodedDrawingWindow(QDialog):
+        """Dedicated full-size technical drawing & exploded assembly window.
+
+        Provides an expansive, uncluttered workspace for inspecting 3D exploded assemblies,
+        orbiting/panning/zooming, adjusting explosion factor (0% to 250%), toggling callouts,
+        table list, and outline mode, and exporting directly to PNG, PDF, or IngeTrazo Composer.
+        Non-modal so the CAD workspace remains active and interactive.
+        """
+
+        def __init__(
+            self,
+            viewport: Any,
+            parts: List[RawPart],
+            entries: List[CutListEntry],
+            unit: str = "mm",
+            initial_explode: float = 0.0,
+            initial_outline: bool = False,
+            initial_table: bool = True,
+            initial_callouts: bool = True,
+            parent: Optional[QWidget] = None,
+        ) -> None:
+            super().__init__(parent)
+            self.viewport = viewport
+            self.parts = parts
+            self.entries = entries
+            self.unit = unit
+
+            self.setWindowTitle("IngeTrazo Cut List — Exploded Assembly Drawing")
+            self.resize(1260, 840)
+            self.setMinimumSize(820, 560)
+            self.setModal(False)
+            self.setWindowFlags(self.windowFlags() | Qt.Window)
+            self.setStyleSheet("""
+                QDialog {
+                    background-color: #1e293b;
+                    color: #f8fafc;
+                }
+                QLabel {
+                    color: #f8fafc;
+                }
+                QCheckBox {
+                    color: #f8fafc;
+                    font-weight: 500;
+                    spacing: 6px;
+                }
+                QPushButton {
+                    background-color: #334155;
+                    color: #f8fafc;
+                    border: 1px solid #475569;
+                    padding: 5px 12px;
+                    border-radius: 4px;
+                    font-size: 12px;
+                }
+                QPushButton:hover {
+                    background-color: #475569;
+                    border-color: #64748b;
+                }
+                QPushButton:pressed {
+                    background-color: #1e293b;
+                }
+            """)
+            self._build_ui(initial_explode, initial_outline, initial_table, initial_callouts)
+
+        def _build_ui(
+            self,
+            initial_explode: float,
+            initial_outline: bool,
+            initial_table: bool,
+            initial_callouts: bool,
+        ) -> None:
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(10, 10, 10, 8)
+            layout.setSpacing(8)
+
+            # Top toolbar
+            tb = QHBoxLayout()
+            tb.setSpacing(8)
+
+            tb.addWidget(QLabel("<b>Explosion:</b>"))
+            self.explode_slider = QSlider(Qt.Horizontal)
+            self.explode_slider.setRange(0, 250)
+            self.explode_slider.setValue(int(initial_explode * 100))
+            self.explode_slider.setToolTip("Adjust spacing between exploded components (0% = Assembled, 100% = Standard Exploded, 250% = Max Spacing).")
+            self.explode_slider.valueChanged.connect(self._on_slider_exploded)
+            self.explode_slider.sliderReleased.connect(self._on_slider_released)
+            tb.addWidget(self.explode_slider, stretch=2)
+
+            self.slider_label = QLabel(f"{int(initial_explode * 100)}%")
+            self.slider_label.setFixedWidth(42)
+            self.slider_label.setStyleSheet("font-weight: bold; color: #38bdf8;")
+            tb.addWidget(self.slider_label)
+
+            # Views
+            self.iso_btn = QPushButton("Isometric")
+            self.iso_btn.clicked.connect(lambda: self.drawing_widget.set_view_angles(-45.0, 30.0))
+            tb.addWidget(self.iso_btn)
+
+            self.front_btn = QPushButton("Front")
+            self.front_btn.clicked.connect(lambda: self.drawing_widget.set_view_angles(-90.0, 0.0))
+            tb.addWidget(self.front_btn)
+
+            self.top_btn = QPushButton("Top")
+            self.top_btn.clicked.connect(lambda: self.drawing_widget.set_view_angles(-90.0, 89.0))
+            tb.addWidget(self.top_btn)
+
+            self.reset_btn = QPushButton("Reset View")
+            self.reset_btn.clicked.connect(self.drawing_widget.reset_view)
+            tb.addWidget(self.reset_btn)
+
+            # Toggles
+            self.callouts_chk = QCheckBox("Callouts (A, B...)")
+            self.callouts_chk.setChecked(initial_callouts)
+            self.callouts_chk.setToolTip("Toggle callout balloon tags on components.")
+            self.callouts_chk.toggled.connect(self._toggle_callouts)
+            tb.addWidget(self.callouts_chk)
+
+            self.legend_chk = QCheckBox("Table List")
+            self.legend_chk.setChecked(initial_table)
+            self.legend_chk.setToolTip("Toggle parts legend table on/off.")
+            self.legend_chk.toggled.connect(self._toggle_legend)
+            tb.addWidget(self.legend_chk)
+
+            self.outline_chk = QCheckBox("Outline Mode")
+            self.outline_chk.setChecked(initial_outline)
+            self.outline_chk.setToolTip("Render in clean non-materialized architectural outline mode.")
+            self.outline_chk.toggled.connect(self._toggle_outline_mode)
+            tb.addWidget(self.outline_chk)
+
+            tb.addStretch(1)
+
+            # Export actions
+            self.export_png_btn = QPushButton("💾 Export PNG...")
+            self.export_png_btn.setToolTip("Export high-resolution drawing image.")
+            self.export_png_btn.clicked.connect(lambda: export_assembly_drawing_png(self.drawing_widget, self, self.viewport))
+            tb.addWidget(self.export_png_btn)
+
+            self.export_pdf_btn = QPushButton("📄 Export PDF...")
+            self.export_pdf_btn.setToolTip("Export print-ready PDF drawing sheet.")
+            self.export_pdf_btn.clicked.connect(lambda: export_assembly_drawing_pdf(self.drawing_widget, self, self.viewport))
+            tb.addWidget(self.export_pdf_btn)
+
+            self.export_composer_btn = QPushButton("📐 Export to Composer...")
+            self.export_composer_btn.setToolTip("Export drawing directly into IngeTrazo Sheet Composer.")
+            self.export_composer_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2b9348;
+                    color: #ffffff;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #227338;
+                }
+            """)
+            self.export_composer_btn.clicked.connect(lambda: export_assembly_drawing_to_composer(self.drawing_widget, self, self.viewport))
+            tb.addWidget(self.export_composer_btn)
+
+            layout.addLayout(tb)
+
+            # Main drawing canvas
+            self.drawing_widget = ExplodedDrawingWidget(viewport=self.viewport, parent=self)
+            self.drawing_widget.set_data(self.parts, self.entries, self.unit)
+            self.drawing_widget.explode_factor = initial_explode
+            self.drawing_widget.outline_mode = initial_outline
+            self.drawing_widget.show_legend = initial_table
+            self.drawing_widget.show_callouts = initial_callouts
+            layout.addWidget(self.drawing_widget, stretch=1)
+
+            # Bottom info bar
+            bb = QHBoxLayout()
+            hint_lbl = QLabel("💡 <b>Navigation:</b> Left-click drag to <b>Orbit</b> • Right-click drag to <b>Pan</b> • Mouse wheel to <b>Zoom</b> • Drag <b>Explosion slider</b> to pull parts apart in 3D")
+            hint_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            bb.addWidget(hint_lbl)
+            bb.addStretch(1)
+
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(self.close)
+            bb.addWidget(close_btn)
+
+            layout.addLayout(bb)
+
+        def _on_slider_exploded(self, val: int) -> None:
+            self.slider_label.setText(f"{val}%")
+            self.drawing_widget.set_explode_factor(val / 100.0)
+
+        def _on_slider_released(self) -> None:
+            if getattr(self.drawing_widget, "_idle_timer", None) is not None:
+                self.drawing_widget._idle_timer.stop()
+            self.drawing_widget.update_3d_render(full_res=True, refresh_cad=True)
+
+        def _toggle_callouts(self, checked: bool) -> None:
+            self.drawing_widget.show_callouts = checked
+            self.drawing_widget.update()
+
+        def _toggle_legend(self, checked: bool) -> None:
+            self.drawing_widget.show_legend = checked
+            self.drawing_widget.update()
+
+        def _toggle_outline_mode(self, checked: bool) -> None:
+            self.drawing_widget.outline_mode = checked
+            if not checked and (self.drawing_widget._cached_image is None or self.drawing_widget._cached_image.isNull()):
+                self.drawing_widget.update_3d_render(full_res=True, refresh_cad=False)
+            self.drawing_widget.update()
 
 
 # ---------------------------------------------------------------------------
@@ -4995,6 +5520,23 @@ if QT_AVAILABLE:
             self.export_composer_btn.setToolTip("Export high-resolution exploded drawing directly into IngeTrazo Sheet Composer.")
             self.export_composer_btn.clicked.connect(self._export_to_composer)
             exp_toolbar.addWidget(self.export_composer_btn)
+
+            self.popout_btn = QPushButton("🪟 New Window")
+            self.popout_btn.setToolTip("Open exploded technical drawing in a large, dedicated standalone window.")
+            self.popout_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #0284c7;
+                    color: #ffffff;
+                    font-weight: bold;
+                    padding: 4px 12px;
+                    border-radius: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #0369a1;
+                }
+            """)
+            self.popout_btn.clicked.connect(self.open_drawing_window)
+            exp_toolbar.addWidget(self.popout_btn)
 
             te_layout.addLayout(exp_toolbar)
 
@@ -6335,219 +6877,51 @@ if QT_AVAILABLE:
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save image:\n{e}")
 
-        def _export_drawing_png(self) -> None:
-            path, _ = QFileDialog.getSaveFileName(self, "Export Exploded Drawing PNG", "exploded_drawing.png", "PNG Images (*.png)")
-            if not path:
+        def open_drawing_window(self) -> None:
+            """Open exploded assembly technical drawing in a large, dedicated standalone window."""
+            if not self.raw_parts:
+                QMessageBox.warning(
+                    self,
+                    "No Parts Selected",
+                    "Please select parts in the 3D viewport and click 'Generate' first."
+                )
                 return
-            try:
-                w, h = 2400, 1600
-                pix = QPixmap(w, h)
-                pix.fill(Qt.transparent)
-                p = QPainter(pix)
-                self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h), is_export=True)
-                p.end()
-                pix.save(path, "PNG")
-                QMessageBox.information(self, "Complete", f"Exploded drawing exported to:\n{path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to export drawing image:\n{e}")
+            current_factor = getattr(self.drawing_widget, "explode_factor", 0.0)
+            current_outline = getattr(self.drawing_widget, "outline_mode", False)
+            current_table = getattr(self.drawing_widget, "show_legend", True)
+            current_callouts = getattr(self.drawing_widget, "show_callouts", True)
+
+            parent_win = self.parent() if hasattr(self, "parent") else None
+            dlg = ExplodedDrawingWindow(
+                viewport=self.viewport,
+                parts=self.raw_parts,
+                entries=self.entries,
+                unit=self.unit_combo.currentText(),
+                initial_explode=current_factor,
+                initial_outline=current_outline,
+                initial_table=current_table,
+                initial_callouts=current_callouts,
+                parent=parent_win,
+            )
+            dlg.drawing_widget.rot_z = self.drawing_widget.rot_z
+            dlg.drawing_widget.rot_x = self.drawing_widget.rot_x
+            dlg.drawing_widget.zoom = self.drawing_widget.zoom
+            dlg.drawing_widget.pan_x = self.drawing_widget.pan_x
+            dlg.drawing_widget.pan_y = self.drawing_widget.pan_y
+
+            self._drawing_window = dlg
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+
+        def _export_drawing_png(self) -> None:
+            export_assembly_drawing_png(self.drawing_widget, self, self.viewport)
 
         def _export_drawing_pdf(self) -> None:
-            path, _ = QFileDialog.getSaveFileName(self, "Export Exploded Drawing PDF", "exploded_drawing.pdf", "PDF Documents (*.pdf)")
-            if not path:
-                return
-            try:
-                try:
-                    pdf = QPdfWriter(path)
-                    pdf.setPageSize(QPageSize(QPageSize.A4))
-                    pdf.setPageOrientation(QPageLayout.Landscape)
-                    p = QPainter(pdf)
-                    target = QRectF(0, 0, pdf.width(), pdf.height())
-                    self.drawing_widget.render_drawing(p, target, is_export=True)
-                    p.end()
-                    QMessageBox.information(self, "Complete", f"Exploded drawing PDF exported to:\n{path}")
-                except Exception:
-                    w, h = 2400, 1600
-                    pix = QPixmap(w, h)
-                    p = QPainter(pix)
-                    self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h), is_export=True)
-                    p.end()
-                    pix.save(path, "PDF")
-                    QMessageBox.information(self, "Complete", f"Exploded drawing PDF saved to:\n{path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to export PDF:\n{e}")
+            export_assembly_drawing_pdf(self.drawing_widget, self, self.viewport)
 
         def _export_to_composer(self) -> None:
-            """Exports high-resolution exploded technical drawing directly into IngeTrazo Sheet Composer."""
-            try:
-                # 1. Determine output file path in persistent drawings cache
-                appdata = os.environ.get("APPDATA")
-                if appdata:
-                    drawings_dir = Path(appdata) / "IngeTrazo" / "drawings"
-                else:
-                    drawings_dir = Path.home() / ".ingetrazo" / "drawings"
-                drawings_dir.mkdir(parents=True, exist_ok=True)
-
-                doc_name = get_project_name(self.viewport)
-                clean_name = re.sub(r'[^\w\-_\.]', '_', doc_name) if doc_name else "exploded_assembly"
-                path = str(drawings_dir / f"{clean_name}_exploded_drawing.png")
-
-                # 2. Render high-res drawing with title, exploded 3D model, callout balloons, and parts legend
-                w, h = 2400, 1600
-                pix = QPixmap(w, h)
-                pix.fill(Qt.transparent)
-                p = QPainter(pix)
-                self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h), is_export=True)
-                p.end()
-                pix.save(path, "PNG")
-
-                # 3. Locate IngeTrazo MainWindow
-                main_win = None
-                if hasattr(self, "viewport") and self.viewport is not None:
-                    if hasattr(self.viewport, "window"):
-                        main_win = self.viewport.window()
-                    if not main_win and hasattr(self.viewport, "parent") and self.viewport.parent():
-                        p_widget = self.viewport.parent()
-                        if hasattr(p_widget, "window"):
-                            main_win = p_widget.window()
-
-                if not main_win and QT_AVAILABLE:
-                    for widget in QApplication.topLevelWidgets():
-                        if widget.__class__.__name__ == "MainWindow" or hasattr(widget, "_ensure_composer") or hasattr(widget, "_on_open_composer"):
-                            main_win = widget
-                            break
-
-                composer = None
-                if main_win is not None:
-                    if hasattr(main_win, "_ensure_composer"):
-                        composer = main_win._ensure_composer()
-                    elif hasattr(main_win, "_composer"):
-                        composer = main_win._composer
-                    elif hasattr(main_win, "_on_open_composer"):
-                        main_win._on_open_composer()
-                        composer = getattr(main_win, "_composer", None)
-
-                # 4. Insert drawing onto Composer Sheet
-                inserted = False
-                if composer is not None:
-                    try:
-                        # Ensure a sheet exists in scene compositions
-                        scene = getattr(composer, "_scene", None) or getattr(self.viewport, "scene", None)
-                        comps = getattr(scene, "compositions", []) if scene else []
-                        if not getattr(composer, "comp", None) or len(comps) == 0:
-                            if hasattr(composer, "_on_comp_add"):
-                                composer._on_comp_add()
-
-                        # Determine sheet usable dimension in mm
-                        pw, ph = (297.0, 210.0)
-                        if hasattr(composer, "comp") and composer.comp:
-                            if hasattr(composer.comp, "page_size_mm"):
-                                pw, ph = composer.comp.page_size_mm()
-                            m_raw = getattr(composer.comp, "margin_mm", 10.0)
-                            m = float(m_raw) if isinstance(m_raw, (int, float)) else 10.0
-                        else:
-                            m = 10.0
-
-                        avail_w = max(50.0, pw - 2.0 * m)
-                        avail_h = max(50.0, ph - 2.0 * m)
-                        # Aspect ratio 2400 / 1600 = 1.5
-                        target_w = avail_w
-                        target_h = target_w / 1.5
-                        if target_h > avail_h:
-                            target_h = avail_h
-                            target_w = target_h * 1.5
-
-                        x_mm = m + (avail_w - target_w) / 2.0
-                        y_mm = m + (avail_h - target_h) / 2.0
-                        z_val = composer._next_z() if hasattr(composer, "_next_z") else 1
-
-                        # Import core.composition and create ImagenItem
-                        try:
-                            from core.composition import ImagenItem, AddItemCommand
-                            item = ImagenItem(
-                                x_mm=float(x_mm),
-                                y_mm=float(y_mm),
-                                w_mm=float(target_w),
-                                h_mm=float(target_h),
-                                path=path,
-                                z=z_val
-                            )
-                            if hasattr(composer, "history") and hasattr(composer.history, "execute"):
-                                composer.history.execute(AddItemCommand(composer.comp, item))
-                                inserted = True
-                            elif hasattr(composer.comp, "images"):
-                                composer.comp.images.append(item)
-                                inserted = True
-                        except Exception as import_err:
-                            sys.stderr.write(f"[CutList] core.composition import note: {import_err}\n")
-                            import sys
-                            ccomp = sys.modules.get("core.composition")
-                            if ccomp and hasattr(ccomp, "ImagenItem"):
-                                item = ccomp.ImagenItem(
-                                    x_mm=float(x_mm),
-                                    y_mm=float(y_mm),
-                                    w_mm=float(target_w),
-                                    h_mm=float(target_h),
-                                    path=path,
-                                    z=z_val
-                                )
-                                if hasattr(composer.comp, "images"):
-                                    composer.comp.images.append(item)
-                                    inserted = True
-
-                        if hasattr(composer, "_rebuild_canvas"):
-                            composer._rebuild_canvas()
-                        if hasattr(composer, "zoom_fit_page"):
-                            composer.zoom_fit_page()
-
-                    except Exception as err:
-                        sys.stderr.write(f"[CutList] Error adding item to composer: {err}\n")
-
-                # 5. Bring composer forward and handle user transition
-                if composer is not None:
-                    try:
-                        from views.composer import bring_to_front
-                        bring_to_front(composer)
-                    except Exception:
-                        if hasattr(composer, "show"):
-                            composer.show()
-                        if hasattr(composer, "raise_"):
-                            composer.raise_()
-                        if hasattr(composer, "activateWindow"):
-                            composer.activateWindow()
-
-                    # Ask whether to switch to Composer or stay in Cut List
-                    reply = QMessageBox.question(
-                        self,
-                        "IngeTrazo Sheet Composer",
-                        "Exploded assembly drawing has been placed onto the Sheet Composer!\n\n"
-                        "Switch to IngeTrazo Composer now?\n\n"
-                        "(Click 'Yes' to open Composer and start composing your sheet, or 'No' to stay in Cut List).",
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.Yes
-                    )
-                    if reply == QMessageBox.Yes:
-                        self.accept()
-                    else:
-                        orig = self.export_composer_btn.text()
-                        self.export_composer_btn.setText("✓ Placed in Composer!")
-                        QTimer.singleShot(3000, lambda: self.export_composer_btn.setText(orig))
-                else:
-                    # Fallback when running outside IngeTrazo main window: prompt save dialog
-                    save_path, _ = QFileDialog.getSaveFileName(
-                        self,
-                        "Save Exploded Drawing Image",
-                        f"{clean_name}_exploded_drawing.png",
-                        "PNG Images (*.png)"
-                    )
-                    if save_path:
-                        pix.save(save_path, "PNG")
-                        QMessageBox.information(
-                            self,
-                            "Export Complete",
-                            f"Exploded drawing saved to:\n{save_path}\n\nYou can insert this drawing into IngeTrazo Composer via Insert ▸ Image."
-                        )
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to export drawing to IngeTrazo Composer:\n{e}")
+            export_assembly_drawing_to_composer(self.drawing_widget, self, self.viewport)
 
         # -------------------------------------------------------------------
         # Cost & Weight Estimator Methods
@@ -6892,6 +7266,39 @@ def run_cutlist(viewport: Any) -> None:
         win.activateWindow()
 
 
+def run_exploded_drawing(viewport: Any) -> None:
+    """Launch dedicated full-size Exploded Assembly Drawing window directly."""
+    if viewport is None:
+        return
+
+    scene = getattr(viewport, "scene", None)
+    selected_groups = get_selected_groups(scene)
+    parent_win = getattr(viewport, "window", lambda: None)()
+    if not selected_groups:
+        if QT_AVAILABLE and parent_win:
+            QMessageBox.information(
+                parent_win,
+                PLUGIN_TITLE,
+                "Please select the objects (groups or components) you want to include in the drawing first."
+            )
+        return
+
+    raw_parts = extract_raw_parts(viewport, selected_groups)
+    entries = group_parts(raw_parts, merge_by_dimensions=True)
+    if QT_AVAILABLE:
+        dlg = ExplodedDrawingWindow(
+            viewport=viewport,
+            parts=raw_parts,
+            entries=entries,
+            unit="mm",
+            initial_explode=0.0,
+            parent=parent_win,
+        )
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+
 def show_about_dialog(parent: Optional[Any] = None) -> None:
     """Display the OpenCutList About dialog with woodwork / cabinet maker focus and developer credits."""
     if QT_AVAILABLE:
@@ -6941,6 +7348,9 @@ def setup(app: Any) -> None:
     if menu is not None:
         act = menu.addAction(PLUGIN_TITLE, action)
         act.setStatusTip("Generate cutting list, diagrams, and exploded views.")
+        act_draw = menu.addAction("🎨 Exploded Assembly Drawing Window", lambda: run_exploded_drawing(app.viewport))
+        if hasattr(act_draw, "setStatusTip"):
+            act_draw.setStatusTip("Open dedicated standalone 3D exploded assembly drawing window.")
         about_act = menu.addAction("About OpenCutList...", lambda: show_about_dialog(getattr(app, "window", None)))
         if hasattr(about_act, "setStatusTip"):
             about_act.setStatusTip("About OpenCutList for woodworkers & cabinet makers by brillian11")

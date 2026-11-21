@@ -838,6 +838,56 @@ class TestCutListPlugin(unittest.TestCase):
         self.assertIn("if self.outline_mode:\n                    base_color = QColor(\"#ffffff\")", src)
         self.assertIn("if self.outline_mode:\n                        shaded_color = QColor(\"#ffffff\")", src)
 
+    def test_smart_explosion_offsets_and_drawing_window(self):
+        """Verify intelligent 3D explosion layout and dedicated standalone drawing window."""
+        # 1. Setup mock furniture parts (stiles, back panel, shelf)
+        left_stile = cp.RawPart(
+            name="Left Stile", length=2.0, width=0.1, thickness=0.02, material="Oak",
+            min_x=-0.4, max_x=-0.38, min_y=0.0, max_y=0.3, min_z=0.0, max_z=2.0
+        )
+        right_stile = cp.RawPart(
+            name="Right Stile", length=2.0, width=0.1, thickness=0.02, material="Oak",
+            min_x=0.38, max_x=0.4, min_y=0.0, max_y=0.3, min_z=0.0, max_z=2.0
+        )
+        back_panel = cp.RawPart(
+            name="Back Panel", length=2.0, width=0.76, thickness=0.005, material="Plywood",
+            min_x=-0.38, max_x=0.38, min_y=0.0, max_y=0.005, min_z=0.0, max_z=2.0
+        )
+        shelf = cp.RawPart(
+            name="Shelf", length=0.76, width=0.28, thickness=0.02, material="Oak",
+            min_x=-0.38, max_x=0.38, min_y=0.01, max_y=0.29, min_z=0.98, max_z=1.0
+        )
+
+        parts = [left_stile, right_stile, back_panel, shelf]
+
+        # 0% explosion -> all zero
+        zero_offsets = cp.compute_assembly_explosion_offsets(parts, 0.0)
+        for p in parts:
+            self.assertEqual(zero_offsets[id(p)], (0.0, 0.0, 0.0))
+
+        # 100% explosion -> smart outward dispersion
+        exp_offsets = cp.compute_assembly_explosion_offsets(parts, 1.0)
+
+        # Left stile moves left (negative X)
+        self.assertLess(exp_offsets[id(left_stile)][0], 0.0)
+        # Right stile moves right (positive X)
+        self.assertGreater(exp_offsets[id(right_stile)][0], 0.0)
+        # Back panel moves backward (negative Y)
+        self.assertLess(exp_offsets[id(back_panel)][1], 0.0)
+        # Shelf pulls forward out of the cabinet (positive Y)
+        self.assertGreater(exp_offsets[id(shelf)][1], 0.0)
+
+        # 2. Check source for ExplodedDrawingWindow and pop-out button
+        plugin_path = Path(__file__).parent.parent / "cutlist_plugin.py"
+        with open(plugin_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        self.assertIn("class ExplodedDrawingWindow(QDialog):", src)
+        self.assertIn("self.popout_btn = QPushButton(\"🪟 New Window\")", src)
+        self.assertIn("self.popout_btn.clicked.connect(self.open_drawing_window)", src)
+        self.assertIn("def open_drawing_window(self) -> None:", src)
+        self.assertIn("export_assembly_drawing_to_composer", src)
+
 
 if __name__ == "__main__":
     unittest.main()
