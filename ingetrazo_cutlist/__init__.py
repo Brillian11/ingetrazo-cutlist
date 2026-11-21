@@ -41,6 +41,7 @@ try:
         QColor,
         QDesktopServices,
         QFont,
+        QFontDatabase,
         QFontMetrics,
         QIcon,
         QImage,
@@ -72,6 +73,7 @@ try:
         QLabel,
         QLineEdit,
         QMessageBox,
+        QPlainTextEdit,
         QPushButton,
         QScrollArea,
         QSlider,
@@ -94,6 +96,7 @@ except ImportError:
             QColor,
             QDesktopServices,
             QFont,
+            QFontDatabase,
             QFontMetrics,
             QIcon,
             QImage,
@@ -125,6 +128,7 @@ except ImportError:
             QLabel,
             QLineEdit,
             QMessageBox,
+            QPlainTextEdit,
             QPushButton,
             QScrollArea,
             QSlider,
@@ -2551,13 +2555,167 @@ if QT_AVAILABLE:
                 return self.sort_val < other.sort_val
             return super().__lt__(other)
 
+    class CutListConsoleDialog(QDialog):
+        """Monospace console output dialog for viewing, copying, or saving text cut list."""
+
+        def __init__(self, text: str, parent: Optional[QWidget] = None) -> None:
+            super().__init__(parent)
+            self.text = text
+            self.setWindowTitle("Cut List — Console Output")
+            self.resize(860, 560)
+            self.setMinimumSize(600, 380)
+            self.setStyleSheet("""
+                QDialog {
+                    background-color: #0f172a;
+                    color: #f8fafc;
+                }
+            """)
+            self._build_ui()
+
+        def _build_ui(self) -> None:
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+
+            # Header
+            header_layout = QHBoxLayout()
+            icon_lbl = QLabel("🖨️")
+            f_icon = icon_lbl.font()
+            f_icon.setPointSize(16)
+            icon_lbl.setFont(f_icon)
+            header_layout.addWidget(icon_lbl)
+
+            title_lbl = QLabel("<b>Cut List — Console Output</b>")
+            font_t = title_lbl.font()
+            font_t.setPointSize(11)
+            title_lbl.setFont(font_t)
+            title_lbl.setStyleSheet("color: #38bdf8;")
+            header_layout.addWidget(title_lbl)
+            header_layout.addStretch(1)
+
+            hint_lbl = QLabel("ASCII cut list table — Copy to clipboard or save to text file")
+            hint_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            header_layout.addWidget(hint_lbl)
+            layout.addLayout(header_layout)
+
+            # Monospace text view
+            self.text_edit = QPlainTextEdit()
+            self.text_edit.setReadOnly(True)
+            self.text_edit.setPlainText(self.text)
+
+            try:
+                mono_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+            except Exception:
+                mono_font = QFont("Consolas", 10)
+            mono_font.setPointSize(9.5)
+            self.text_edit.setFont(mono_font)
+            self.text_edit.setStyleSheet("""
+                QPlainTextEdit {
+                    background-color: #020617;
+                    color: #e2e8f0;
+                    border: 1px solid #334155;
+                    border-radius: 4px;
+                    padding: 8px;
+                    selection-background-color: #0284c7;
+                    selection-color: #ffffff;
+                }
+            """)
+            layout.addWidget(self.text_edit, stretch=1)
+
+            # Bottom Bar
+            bot_layout = QHBoxLayout()
+            lines = self.text.splitlines()
+            line_count = len(lines)
+            char_count = len(self.text)
+            self.status_lbl = QLabel(f"Lines: {line_count}  |  Characters: {char_count}")
+            self.status_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            bot_layout.addWidget(self.status_lbl)
+            bot_layout.addStretch(1)
+
+            copy_btn = QPushButton("📋 Copy to Clipboard")
+            copy_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #0284c7;
+                    color: white;
+                    font-weight: bold;
+                    border-radius: 4px;
+                    padding: 6px 14px;
+                }
+                QPushButton:hover {
+                    background-color: #0369a1;
+                }
+            """)
+            copy_btn.clicked.connect(self._copy_to_clipboard)
+            bot_layout.addWidget(copy_btn)
+
+            save_btn = QPushButton("💾 Save to File (.txt)...")
+            save_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #1e293b;
+                    color: #f1f5f9;
+                    border: 1px solid #475569;
+                    border-radius: 4px;
+                    padding: 6px 14px;
+                }
+                QPushButton:hover {
+                    background-color: #334155;
+                    border-color: #38bdf8;
+                }
+            """)
+            save_btn.clicked.connect(self._save_to_file)
+            bot_layout.addWidget(save_btn)
+
+            close_btn = QPushButton("Close")
+            close_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #334155;
+                    color: #f1f5f9;
+                    border-radius: 4px;
+                    padding: 6px 16px;
+                }
+                QPushButton:hover {
+                    background-color: #475569;
+                }
+            """)
+            close_btn.clicked.connect(self.accept)
+            bot_layout.addWidget(close_btn)
+
+            layout.addLayout(bot_layout)
+
+        def _copy_to_clipboard(self) -> None:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(self.text)
+            self.status_lbl.setText("✓ Copied full table to clipboard!")
+            QTimer.singleShot(2500, lambda: self.status_lbl.setText(
+                f"Lines: {len(self.text.splitlines())}  |  Characters: {len(self.text)}"
+            ))
+
+        def _save_to_file(self) -> None:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save Cut List Text", "cut_list_table.txt", "Text Files (*.txt);;All Files (*)"
+            )
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self.text)
+                self.status_lbl.setText(f"✓ Saved to {Path(path).name}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save text file:\n{e}")
+
+
     class MaterialLibraryDialog(QDialog):
-        """Search and browse all materials in the IngeTrazo material library."""
+        """Search and browse materials (both In-Model materials and 640+ Library items)
+        for assigning to a component. Material only changes after clicking 'Save Material'.
+        """
 
         def __init__(
             self,
             parent: Optional[QWidget] = None,
             current_material: str = "",
+            available_materials: Optional[List[str]] = None,
+            part_name: str = "",
+            scene: Any = None,
             thumbnail_cache: Optional[Dict] = None,
         ) -> None:
             super().__init__(parent)
@@ -2565,37 +2723,105 @@ if QT_AVAILABLE:
             self.selected_item: Optional[LibraryMaterialItem] = None
             self.thumbnail_cache = thumbnail_cache if thumbnail_cache is not None else {}
             self.current_material = current_material
+            self.available_materials = available_materials or []
+            self.part_name = part_name
+            self.scene = scene
+            self.in_model_items: List[LibraryMaterialItem] = []
 
-            self.setWindowTitle("IngeTrazo Material Library — Select Material")
-            self.resize(720, 540)
-            self.setMinimumSize(580, 420)
+            self._build_in_model_items()
+
+            self.setWindowTitle("Select Material — OpenCutList")
+            self.resize(740, 560)
+            self.setMinimumSize(600, 440)
+            self.setStyleSheet("""
+                QDialog {
+                    background-color: #0f172a;
+                    color: #f8fafc;
+                }
+            """)
             self._build_ui()
             self._populate_categories()
             self._filter_materials()
+            self._select_current_material()
+
+        def _build_in_model_items(self) -> None:
+            lib = get_material_library()
+            seen = set()
+            self.in_model_items.clear()
+
+            all_model_mats = list(self.available_materials)
+            if self.current_material and self.current_material not in all_model_mats:
+                all_model_mats.insert(0, self.current_material)
+
+            for m in all_model_mats:
+                if not m or m in seen:
+                    continue
+                seen.add(m)
+                existing = lib.by_name.get(m.lower())
+                st = get_material_stock_label(m, scene=self.scene)
+                pm = "Solid" if is_linear_stock(st) else "Sheet"
+                if existing:
+                    item = LibraryMaterialItem(
+                        name=m,
+                        category_id="in_model",
+                        category_name="⭐ In Model",
+                        stock_type=existing.stock_type,
+                        packing_mode=existing.packing_mode,
+                        texture_file=existing.texture_file,
+                        rgb=existing.rgb,
+                        sw=existing.sw,
+                        sh=existing.sh,
+                    )
+                else:
+                    item = LibraryMaterialItem(
+                        name=m,
+                        category_id="in_model",
+                        category_name="⭐ In Model",
+                        stock_type=st,
+                        packing_mode=pm,
+                    )
+                self.in_model_items.append(item)
 
         def _build_ui(self) -> None:
             layout = QVBoxLayout(self)
-            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setContentsMargins(14, 14, 14, 14)
             layout.setSpacing(10)
 
-            # Header
-            header_layout = QHBoxLayout()
-            title_lbl = QLabel("<b>IngeTrazo Material Library</b>")
+            # Header with Part & Current Material info
+            header_box = QVBoxLayout()
+            header_box.setSpacing(3)
+
+            top_row = QHBoxLayout()
+            title_lbl = QLabel("<b>Select Component Material</b>")
             font_t = title_lbl.font()
             font_t.setPointSize(11)
             title_lbl.setFont(font_t)
-            header_layout.addWidget(title_lbl)
-            header_layout.addStretch(1)
+            title_lbl.setStyleSheet("color: #38bdf8;")
+            top_row.addWidget(title_lbl)
+            top_row.addStretch(1)
 
-            hint_lbl = QLabel("Double-click any material to apply")
-            hint_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
-            header_layout.addWidget(hint_lbl)
-            layout.addLayout(header_layout)
+            if self.part_name:
+                part_lbl = QLabel(f"Part: <b>{self.part_name}</b>")
+                part_lbl.setStyleSheet("color: #e2e8f0; font-size: 11px;")
+                top_row.addWidget(part_lbl)
+            header_box.addLayout(top_row)
+
+            sub_row = QHBoxLayout()
+            cur_lbl = QLabel(f"Current: <b>{self.current_material or 'None'}</b>")
+            cur_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            sub_row.addWidget(cur_lbl)
+            sub_row.addStretch(1)
+
+            hint_lbl = QLabel("Double-click or click 'Save Material' to apply & update groups")
+            hint_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+            sub_row.addWidget(hint_lbl)
+            header_box.addLayout(sub_row)
+            layout.addLayout(header_box)
 
             # Search & Category Controls
             ctrl_layout = QHBoxLayout()
             self.search_input = QLineEdit()
-            self.search_input.setPlaceholderText("🔍 Search 640+ materials by name, RAL code, wood species...")
+            self.search_input.setPlaceholderText("🔍 Search materials by name, species, RAL color...")
             self.search_input.setClearButtonEnabled(True)
             self.search_input.setStyleSheet("""
                 QLineEdit {
@@ -2660,12 +2886,23 @@ if QT_AVAILABLE:
             bot_layout.addStretch(1)
 
             self.cancel_btn = QPushButton("Cancel")
+            self.cancel_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #334155;
+                    color: #f1f5f9;
+                    border-radius: 4px;
+                    padding: 6px 14px;
+                }
+                QPushButton:hover {
+                    background-color: #475569;
+                }
+            """)
             self.cancel_btn.clicked.connect(self.reject)
             bot_layout.addWidget(self.cancel_btn)
 
-            self.apply_btn = QPushButton("✓ Apply Material")
-            self.apply_btn.setEnabled(False)
-            self.apply_btn.setStyleSheet("""
+            self.save_btn = QPushButton("💾 Save Material")
+            self.save_btn.setEnabled(False)
+            self.save_btn.setStyleSheet("""
                 QPushButton {
                     background-color: #2b9348;
                     color: white;
@@ -2681,15 +2918,18 @@ if QT_AVAILABLE:
                     color: #64748b;
                 }
             """)
-            self.apply_btn.clicked.connect(self._on_apply_clicked)
-            bot_layout.addWidget(self.apply_btn)
+            self.save_btn.clicked.connect(self._on_save_clicked)
+            bot_layout.addWidget(self.save_btn)
             layout.addLayout(bot_layout)
 
         def _populate_categories(self) -> None:
             lib = get_material_library()
             self.cat_combo.blockSignals(True)
             self.cat_combo.clear()
-            self.cat_combo.addItem(f"All Categories ({len(lib.items)})", "")
+            total_items = len(self.in_model_items) + len(lib.items)
+            self.cat_combo.addItem(f"All Materials ({total_items})", "")
+            if self.in_model_items:
+                self.cat_combo.addItem(f"⭐ In Model ({len(self.in_model_items)})", "in_model")
             for cid, cname in lib.categories.items():
                 cnt = lib.category_counts.get(cid, 0)
                 if cnt > 0:
@@ -2702,21 +2942,42 @@ if QT_AVAILABLE:
             cat_id = self.cat_combo.currentData() or ""
 
             matched: List[LibraryMaterialItem] = []
-            for it in lib.items:
-                if cat_id and it.category_id != cat_id:
-                    continue
-                if query:
-                    if query not in it.name.lower() and query not in it.category_name.lower():
+
+            if cat_id == "in_model":
+                for it in self.in_model_items:
+                    if query and query not in it.name.lower():
                         continue
-                matched.append(it)
+                    matched.append(it)
+            elif cat_id:
+                for it in lib.items:
+                    if it.category_id != cat_id:
+                        continue
+                    if query and (query not in it.name.lower() and query not in it.category_name.lower()):
+                        continue
+                    matched.append(it)
+            else:
+                # All: In-model items first, then library items
+                seen_names = set()
+                for it in self.in_model_items:
+                    if query and query not in it.name.lower():
+                        continue
+                    matched.append(it)
+                    seen_names.add(it.name.lower())
+
+                for it in lib.items:
+                    if it.name.lower() in seen_names:
+                        continue
+                    if query and (query not in it.name.lower() and query not in it.category_name.lower()):
+                        continue
+                    matched.append(it)
 
             total_matched = len(matched)
-            display_items = matched[:120] if (not query and not cat_id) else matched
+            display_items = matched[:150] if (not query and not cat_id) else matched
 
             self.table.setRowCount(len(display_items))
             for row, it in enumerate(display_items):
                 # Col 0: Preview Icon
-                _, icon = get_material_thumbnail(it.name, size=24, cache=self.thumbnail_cache)
+                _, icon = get_material_thumbnail(it.name, scene=self.scene, size=24, cache=self.thumbnail_cache)
                 icon_item = QTableWidgetItem()
                 if icon is not None and not icon.isNull():
                     icon_item.setIcon(icon)
@@ -2737,6 +2998,8 @@ if QT_AVAILABLE:
                 # Col 2: Category
                 cat_item = QTableWidgetItem(it.category_name)
                 cat_item.setData(Qt.UserRole, it)
+                if it.category_id == "in_model":
+                    cat_item.setForeground(QColor("#fbbf24"))
                 self.table.setItem(row, 2, cat_item)
 
                 # Col 3: Stock Type
@@ -2746,11 +3009,33 @@ if QT_AVAILABLE:
 
                 self.table.setRowHeight(row, 26)
 
-            self.status_lbl.setText(f"Showing {len(display_items)} of {total_matched} materials (Library total: {len(lib.items)})")
-            self.apply_btn.setEnabled(self.table.currentRow() >= 0)
+            self.status_lbl.setText(f"Showing {len(display_items)} of {total_matched} materials")
+            self.save_btn.setEnabled(self.table.currentRow() >= 0)
+
+        def _select_current_material(self) -> None:
+            if not self.current_material:
+                if self.table.rowCount() > 0:
+                    self.table.selectRow(0)
+                return
+            for r in range(self.table.rowCount()):
+                item = self.table.item(r, 1)
+                if item and item.text().lower() == self.current_material.lower():
+                    self.table.selectRow(r)
+                    self.table.scrollToItem(item)
+                    return
+            if self.table.rowCount() > 0:
+                self.table.selectRow(0)
 
         def _on_selection_changed(self) -> None:
-            self.apply_btn.setEnabled(self.table.currentRow() >= 0)
+            row = self.table.currentRow()
+            if row >= 0:
+                item = self.table.item(row, 1)
+                it = item.data(Qt.UserRole) if item else None
+                if it:
+                    self.status_lbl.setText(f"Selected: {it.name} ({it.category_name})")
+                self.save_btn.setEnabled(True)
+            else:
+                self.save_btn.setEnabled(False)
 
         def _on_double_clicked(self, item: QTableWidgetItem) -> None:
             it = item.data(Qt.UserRole)
@@ -2759,7 +3044,7 @@ if QT_AVAILABLE:
                 self.selected_item = it
                 self.accept()
 
-        def _on_apply_clicked(self) -> None:
+        def _on_save_clicked(self) -> None:
             row = self.table.currentRow()
             if row >= 0:
                 item = self.table.item(row, 1)
@@ -3626,14 +3911,26 @@ if QT_AVAILABLE:
 
             return sorted(mats, key=lambda s: s.lower())
 
-        def _open_material_library_dialog(self, entry: CutListEntry, combo: Optional[QComboBox] = None) -> None:
-            dlg = MaterialLibraryDialog(self, current_material=entry.material, thumbnail_cache=self._thumbnail_cache)
-            if dlg.exec_() == QDialog.Accepted and dlg.selected_material:
+        def _open_material_library_dialog(self, entry: CutListEntry, combo: Optional[Any] = None) -> None:
+            scene = getattr(self.viewport, "scene", None) if hasattr(self, "viewport") else None
+            available_mats = self._get_available_materials()
+            dlg = MaterialLibraryDialog(
+                self,
+                current_material=entry.material,
+                available_materials=available_mats,
+                part_name=entry.display_name,
+                scene=scene,
+                thumbnail_cache=self._thumbnail_cache,
+            )
+            exec_fn = getattr(dlg, "exec", None) or getattr(dlg, "exec_")
+            if exec_fn() == QDialog.Accepted and dlg.selected_material:
                 chosen_mat = dlg.selected_material
                 chosen_item = dlg.selected_item
 
+                if chosen_mat == entry.material:
+                    return
+
                 # Register in IngeTrazo scene.materials if needed
-                scene = getattr(self.viewport, "scene", None) if hasattr(self, "viewport") else None
                 if scene and hasattr(scene, "materials") and chosen_item is not None:
                     raw_mats = scene.materials
                     mat_list = raw_mats if isinstance(raw_mats, list) else list(raw_mats.values())
@@ -3671,15 +3968,15 @@ if QT_AVAILABLE:
 
                 self._on_part_material_changed(entry, combo=combo, new_mat=chosen_mat)
 
-        def _on_part_material_changed(self, entry: CutListEntry, combo: Optional[QComboBox] = None, new_mat: Optional[str] = None) -> None:
-            if new_mat is None and combo is not None:
+        def _on_part_material_changed(self, entry: CutListEntry, combo: Optional[Any] = None, new_mat: Optional[str] = None) -> None:
+            if new_mat is None and combo is not None and hasattr(combo, "currentText"):
                 new_mat = combo.currentText().strip()
 
             if not new_mat:
                 return
 
             if "Search All Library" in new_mat or "Browse / Search" in new_mat:
-                if combo is not None:
+                if combo is not None and hasattr(combo, "blockSignals"):
                     combo.blockSignals(True)
                     combo.setCurrentText(entry.material)
                     combo.blockSignals(False)
@@ -3922,83 +4219,42 @@ if QT_AVAILABLE:
                     thick_item.setForeground(QColor("#f59e0b"))
                     self.table.setItem(row_idx, 7, thick_item)
 
-                    # Column 8: Material Dropdown + Search All Library Button
+                    # Column 8: Material Button (Click to open material picker dialog; ignores mouse wheel)
                     cell_widget = QWidget()
                     cell_layout = QHBoxLayout(cell_widget)
-                    cell_layout.setContentsMargins(1, 1, 1, 1)
-                    cell_layout.setSpacing(3)
+                    cell_layout.setContentsMargins(2, 2, 2, 2)
+                    cell_layout.setSpacing(0)
 
-                    mat_combo = QComboBox()
-                    mat_combo.setIconSize(QSize(18, 18))
-                    mat_combo.setStyleSheet("""
-                        QComboBox {
-                            background-color: #1e293b;
-                            color: #f1f5f9;
-                            border: 1px solid #475569;
-                            border-radius: 4px;
-                            padding: 2px 6px 2px 6px;
-                            font-size: 11px;
-                        }
-                        QComboBox:hover {
-                            border-color: #38bdf8;
-                        }
-                        QComboBox::drop-down {
-                            subcontrol-origin: padding;
-                            subcontrol-position: top right;
-                            width: 18px;
-                            border-left: 1px solid #334155;
-                        }
-                        QComboBox QAbstractItemView {
-                            background-color: #0f172a;
-                            color: #f1f5f9;
-                            selection-background-color: #0284c7;
-                            selection-color: #ffffff;
-                            border: 1px solid #475569;
-                        }
-                    """)
-                    mat_combo.blockSignals(True)
-                    combo_mats = list(available_materials)
-                    if e.material not in combo_mats:
-                        combo_mats.insert(0, e.material)
-                    for cm in combo_mats:
-                        _, cm_icon = get_material_thumbnail(cm, scene=scene, size=18, cache=self._thumbnail_cache)
-                        if cm_icon is not None and not cm_icon.isNull():
-                            mat_combo.addItem(cm_icon, cm)
-                        else:
-                            mat_combo.addItem(cm)
-
-                    mat_combo.insertSeparator(mat_combo.count())
-                    mat_combo.addItem("🔍 Browse / Search All Library (640+)...")
-                    mat_combo.setCurrentText(e.material)
-                    mat_combo.blockSignals(False)
-
-                    mat_combo.currentIndexChanged.connect(
-                        lambda idx, entry=e, cb=mat_combo: self._on_part_material_changed(entry, cb)
-                    )
-                    cell_layout.addWidget(mat_combo, stretch=1)
-
-                    search_btn = QPushButton("🔍")
-                    search_btn.setToolTip("Search all 640+ library materials...")
-                    search_btn.setFixedSize(24, 22)
-                    search_btn.setStyleSheet("""
+                    mat_btn = QPushButton()
+                    if mat_icon is not None and not mat_icon.isNull():
+                        mat_btn.setIcon(mat_icon)
+                        mat_btn.setIconSize(QSize(18, 18))
+                    mat_btn.setText(f"  {e.material}   ▾")
+                    mat_btn.setToolTip(f"Click to change material for '{e.display_name}' (Current: {e.material})\nOpens Material Library Dialog — Click 'Save Material' to apply.")
+                    mat_btn.setCursor(Qt.PointingHandCursor)
+                    mat_btn.setStyleSheet("""
                         QPushButton {
                             background-color: #1e293b;
-                            color: #94a3b8;
+                            color: #f1f5f9;
                             border: 1px solid #475569;
                             border-radius: 4px;
+                            padding: 3px 8px;
                             font-size: 11px;
-                            padding: 0;
+                            text-align: left;
                         }
                         QPushButton:hover {
-                            background-color: #0284c7;
-                            color: #ffffff;
+                            background-color: #334155;
                             border-color: #38bdf8;
+                            color: #ffffff;
+                        }
+                        QPushButton:pressed {
+                            background-color: #0284c7;
                         }
                     """)
-                    search_btn.clicked.connect(
-                        lambda _checked, entry=e, cb=mat_combo: self._open_material_library_dialog(entry, cb)
+                    mat_btn.clicked.connect(
+                        lambda _checked, entry=e: self._open_material_library_dialog(entry)
                     )
-                    cell_layout.addWidget(search_btn, stretch=0)
+                    cell_layout.addWidget(mat_btn)
 
                     self.table.setCellWidget(row_idx, 8, cell_widget)
 
@@ -4152,11 +4408,32 @@ if QT_AVAILABLE:
 
         def _print_console(self) -> None:
             u = self.unit_combo.currentText()
-            print(format_console_table(self.entries, unit=u))
-            sys.stdout.flush()
+            table_txt = format_console_table(self.entries, unit=u)
+
+            # 1. Output to standard stdout
+            try:
+                print(table_txt)
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+            # 2. Forward to IngeTrazo's built-in Python Console if active
+            try:
+                win = self.parent() or getattr(self, "parent_window", None)
+                if win is not None:
+                    py_console = getattr(win, "_python_console", None)
+                    if py_console is not None and hasattr(py_console, "_append_text"):
+                        py_console._append_text(table_txt + "\n", role="out")
+            except Exception:
+                pass
+
+            # 3. Temporarily update button label
             orig = self.print_btn.text()
             self.print_btn.setText("✓ Printed!")
             QTimer.singleShot(1500, lambda: self.print_btn.setText(orig))
+
+            # 4. Open dedicated monospace console dialog
+            show_console_dialog(table_txt, parent=self)
 
         def _save_diagram_png(self) -> None:
             path, _ = QFileDialog.getSaveFileName(self, "Save Diagram Image", "cutting_diagram.png", "PNG Images (*.png)")
@@ -4250,6 +4527,15 @@ def show_about_dialog(parent: Optional[Any] = None) -> None:
         print(f"Target Audience: {PLUGIN_AUDIENCE}")
         print("Dedicated cut list, 1D/2D nesting, and technical drawing suite for Woodworkers & Cabinet Makers.")
         print(f"Developer: {PLUGIN_AUTHOR} ({PLUGIN_GITHUB})")
+
+
+def show_console_dialog(text: str, parent: Optional[Any] = None) -> None:
+    """Display the monospace console output dialog or print to stdout if headless."""
+    if QT_AVAILABLE:
+        dlg = CutListConsoleDialog(text, parent=parent)
+        dlg.exec()
+    else:
+        print(text)
 
 
 # ---------------------------------------------------------------------------

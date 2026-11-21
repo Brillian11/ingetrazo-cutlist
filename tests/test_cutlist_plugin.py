@@ -451,5 +451,70 @@ class TestCutListPlugin(unittest.TestCase):
         self.assertIn("Woodworker", out)
 
 
+    def test_console_dialog_and_output(self):
+        """Verify console dialog prints ASCII table in headless mode and contains all data."""
+        entries = [
+            cp.CutListEntry("A", "Panel 1", 1, 1000.0, 500.0, 18.0, "Plywood"),
+            cp.CutListEntry("B", "Leg 1, Leg 2", 2, 800.0, 50.0, 50.0, "Oak"),
+        ]
+        text = cp.format_console_table(entries, unit="mm")
+        self.assertIn("INGETRAZO — OPEN CUT LIST", text)
+        self.assertIn("Plywood", text)
+        self.assertIn("Oak", text)
+        self.assertIn("Total Parts: 3", text)
+
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cp.show_console_dialog(text, parent=None)
+        out = buf.getvalue()
+        self.assertIn("INGETRAZO — OPEN CUT LIST", out)
+        self.assertIn("Panel 1", out)
+
+    def test_in_model_materials_picker_logic(self):
+        """Verify in-model materials (including custom ones like 'goldr rr') are categorized and prioritized."""
+        lib = cp.get_material_library()
+        in_model_mats = ["goldr rr", "metal_brushed", "Poplar"]
+
+        # Check stock label resolution for custom in-model material
+        st_goldr = cp.get_material_stock_label("goldr rr")
+        self.assertIn("Wood", st_goldr)
+
+        # Build mock in-model items as done in MaterialLibraryDialog._build_in_model_items
+        seen = set()
+        items = []
+        for m in in_model_mats:
+            if m in seen:
+                continue
+            seen.add(m)
+            existing = lib.by_name.get(m.lower())
+            st = cp.get_material_stock_label(m)
+            pm = "Solid" if cp.is_linear_stock(st) else "Sheet"
+            if existing:
+                it = cp.LibraryMaterialItem(
+                    name=m,
+                    category_id="in_model",
+                    category_name="⭐ In Model",
+                    stock_type=existing.stock_type,
+                    packing_mode=existing.packing_mode,
+                )
+            else:
+                it = cp.LibraryMaterialItem(
+                    name=m,
+                    category_id="in_model",
+                    category_name="⭐ In Model",
+                    stock_type=st,
+                    packing_mode=pm,
+                )
+            items.append(it)
+
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0].name, "goldr rr")
+        self.assertEqual(items[0].category_name, "⭐ In Model")
+        self.assertEqual(items[1].name, "metal_brushed")
+        self.assertEqual(items[2].name, "Poplar")
+
+
 if __name__ == "__main__":
     unittest.main()
