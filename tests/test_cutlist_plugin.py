@@ -2,8 +2,10 @@
 # Copyright (C) 2026 IngeTrazo Extension Developer
 """Unit tests for the OpenCutList plugin for IngeTrazo (v1.4.0)."""
 import os
+import tempfile
 import unittest
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, List, Optional
 
 import cutlist_plugin as cp
@@ -593,6 +595,166 @@ class TestCutListPlugin(unittest.TestCase):
         self.assertIn("Rough Cut (L×W×T)", txt)
         self.assertIn("Rough Vol:", txt)
         self.assertIn("Oak", txt)
+
+    def test_estimator_raw_stock_vs_net_parts(self):
+        """Verify sheet and board cost calculations in raw_stock vs net_parts modes."""
+        e_sheet = cp.CutListEntry("A", "Cabinet Side", 2, 1.20, 0.60, 0.018, "Plywood Birch")
+        e_lumber = cp.CutListEntry("B", "Face Frame", 4, 1.00, 0.05, 0.020, "Pine Solid")
+        entries = [e_sheet, e_lumber]
+
+        mat_types = {
+            "Plywood Birch": "🔲 Wood (Sheet / Plywood)",
+            "Pine Solid": "🌲 Solid Wood (Lumber)",
+        }
+
+        pricing = {
+            "Plywood Birch": cp.MaterialPricingConfig("Plywood Birch", pricing_basis="sheet", unit_price=60.0, density_kg_m3=650.0, waste_pct=10.0),
+            "Pine Solid": cp.MaterialPricingConfig("Pine Solid", pricing_basis="board", unit_price=12.0, density_kg_m3=500.0, waste_pct=0.0),
+        }
+
+        # 1. Commercial Raw Stock Mode
+        params_raw = cp.EstimatorParameters(estimation_mode="raw_stock", currency_symbol="$")
+        summary_raw = cp.compute_project_estimate(entries, mat_types, pricing_configs=pricing, params=params_raw)
+
+        # e_sheet total area = 1.44 m2 -> 1 raw sheet (2.44x1.22 = 2.9768 m2) -> 1 * $60 = $60
+        # e_lumber total length = 4.0 m -> 2 raw boards (2.4m each) -> 2 * $12 = $24
+        line_sheet_raw = next(l for l in summary_raw.material_lines if l.material_name == "Plywood Birch")
+        line_lumber_raw = next(l for l in summary_raw.material_lines if l.material_name == "Pine Solid")
+
+        self.assertEqual(line_sheet_raw.raw_units_count, 1)
+        self.assertEqual(line_sheet_raw.raw_units_label, "sheets")
+        self.assertAlmostEqual(line_sheet_raw.material_cost, 60.0)
+
+        self.assertEqual(line_lumber_raw.raw_units_count, 2)
+        self.assertEqual(line_lumber_raw.raw_units_label, "boards")
+        self.assertAlmostEqual(line_lumber_raw.material_cost, 24.0)
+        self.assertAlmostEqual(summary_raw.materials_cost_subtotal, 84.0)
+
+        # 2. Net Parts Mode (with 10% waste for Plywood)
+        params_net = cp.EstimatorParameters(estimation_mode="net_parts", currency_symbol="$")
+        summary_net = cp.compute_project_estimate(entries, mat_types, pricing_configs=pricing, params=params_net)
+
+        line_sheet_net = next(l for l in summary_net.material_lines if l.material_name == "Plywood Birch")
+        line_lumber_net = next(l for l in summary_net.material_lines if l.material_name == "Pine Solid")
+
+        std_sheet_area = 2.44 * 1.22
+        expected_sheet_cost = (1.44 / std_sheet_area) * 60.0 * 1.10
+        self.assertAlmostEqual(line_sheet_net.material_cost, expected_sheet_cost, places=2)
+
+        expected_board_cost = (4.0 / 2.4) * 12.0 * 1.00
+        self.assertAlmostEqual(line_lumber_net.material_cost, 20.0, places=2)
+
+    def test_estimator_weight_and_units(self):
+        """Verify weight calculation using physical density in kg and lb."""
+        entry = cp.CutListEntry("A", "Oak Tabletop", 1, 2.0, 1.0, 0.030, "White Oak")
+        mat_types = {"White Oak": "🔲 Wood (Sheet / Plywood)"}
+        pricing = {
+            "White Oak": cp.MaterialPricingConfig("White Oak", pricing_basis="volume", unit_price=1200.0, density_kg_m3=720.0),
+        }
+
+        # Finished vol = 2.0 * 1.0 * 0.030 = 0.060 m3
+        # Weight = 0.060 * 720.0 = 43.2 kg
+        # In kg mode
+        params_kg = cp.EstimatorParameters(weight_unit="kg")
+        summary_kg = cp.compute_project_estimate([entry], mat_types, pricing_configs=pricing, params=params_kg)
+        self.assertAlmostEqual(summary_kg.total_weight_kg, 43.2, places=2)
+        self.assertIn("43.2 kg", summary_kg.total_weight_display)
+
+        # In lb mode (1 kg = 2.20462 lb) -> 43.2 * 2.20462 = ~95.2 lb
+        params_lb = cp.EstimatorParameters(weight_unit="lb")
+        summary_lb = cp.compute_project_estimate([entry], mat_types, pricing_configs=pricing, params=params_lb)
+        self.assertIn("95.2 lb", summary_lb.total_weight_display)
+
+    def test_estimator_operations_margin_tax(self):
+        """Verify labor, cutting fees, edge banding, hardware, margin %, and tax %."""
+        entry = cp.CutListEntry("A", "Desk Top", 1, 1.5, 0.8, 0.025, "MDF")
+        mat_types = {"MDF": "🔲 Wood (Sheet / Plywood)"}
+        pricing = {
+            "MDF": cp.MaterialPricingConfig("MDF", pricing_basis="sheet", unit_price=40.0, density_kg_m3=700.0),
+        }
+
+        params = cp.EstimatorParameters(
+            currency_symbol="$",
+            estimation_mode="raw_stock",
+            labor_hours=5.0,
+            labor_rate_hourly=40.0,            # 5 * 40 = $200
+            cutting_fee_per_sheet=10.0,         # 1 sheet * 10 = $10
+            edge_banding_price_per_m=2.0,
+            edge_banding_meters=15.0,           # 15 * 2 = $30 -> machining subtotal = 10 + 30 = $40
+            hardware_total=50.0,                # Extras = 50 + 20 + 30 = $100
+            finish_coating_total=20.0,
+            shipping_delivery_total=30.0,
+            overhead_margin_pct=20.0,           # 20% markup
+            tax_vat_pct=10.0,                   # 10% tax
+        )
+
+        summary = cp.compute_project_estimate([entry], mat_types, pricing_configs=pricing, params=params)
+
+        self.assertAlmostEqual(summary.materials_cost_subtotal, 40.0)
+        self.assertAlmostEqual(summary.labor_cost_subtotal, 200.0)
+        self.assertAlmostEqual(summary.machining_cutting_subtotal, 40.0)
+        self.assertAlmostEqual(summary.hardware_extras_subtotal, 100.0)
+
+        # Net cost = 40 + 200 + 40 + 100 = 380.0
+        self.assertAlmostEqual(summary.net_cost, 380.0)
+
+        # Overhead margin = 380 * 0.20 = 76.0 -> Subtotal with margin = 456.0
+        self.assertAlmostEqual(summary.overhead_margin_amount, 76.0)
+
+        # Tax = 456.0 * 0.10 = 45.60
+        self.assertAlmostEqual(summary.tax_amount, 45.60)
+
+        # Final quote = 456.0 + 45.60 = 501.60
+        self.assertAlmostEqual(summary.total_project_quote, 501.60)
+
+    def test_estimator_pricing_library_persistence(self):
+        """Verify save_material_pricing_library and load_material_pricing_library JSON round-trip."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test_pricing.json"
+            orig_func = cp.get_estimator_pricing_file_path
+            cp.get_estimator_pricing_file_path = lambda: test_file
+            try:
+                # Initially empty
+                self.assertEqual(cp.load_material_pricing_library(), {})
+
+                # Save custom configs
+                configs = {
+                    "Walnut": cp.MaterialPricingConfig("Walnut", "volume", 1500.0, 680.0, 5.0),
+                    "Melamine White": cp.MaterialPricingConfig("Melamine White", "sheet", 35.0, 720.0, 0.0),
+                }
+                success = cp.save_material_pricing_library(configs)
+                self.assertTrue(success)
+                self.assertTrue(test_file.exists())
+
+                # Reload and verify
+                loaded = cp.load_material_pricing_library()
+                self.assertIn("Walnut", loaded)
+                self.assertIn("Melamine White", loaded)
+                self.assertEqual(loaded["Walnut"].pricing_basis, "volume")
+                self.assertAlmostEqual(loaded["Walnut"].unit_price, 1500.0)
+                self.assertAlmostEqual(loaded["Walnut"].density_kg_m3, 680.0)
+                self.assertAlmostEqual(loaded["Walnut"].waste_pct, 5.0)
+                self.assertEqual(loaded["Melamine White"].pricing_basis, "sheet")
+                self.assertAlmostEqual(loaded["Melamine White"].unit_price, 35.0)
+            finally:
+                cp.get_estimator_pricing_file_path = orig_func
+
+    def test_render_estimate_pdf_and_csv(self):
+        """Verify headless PDF and CSV export generation for commercial estimates."""
+        entry = cp.CutListEntry("A", "Bookcase Shelf", 6, 0.80, 0.30, 0.018, "Pine")
+        summary = cp.compute_project_estimate([entry])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = os.path.join(tmpdir, "estimate_test.pdf")
+            cp.render_estimate_pdf(pdf_path, summary, project_name="Test Project")
+
+            self.assertTrue(os.path.exists(pdf_path))
+            with open(pdf_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("%PDF-1.4", content)
+            self.assertIn("COMMERCIAL ESTIMATE & QUOTE", content)
+            self.assertIn("GRAND TOTAL QUOTE", content)
+            self.assertIn("Pine", content)
 
 
 if __name__ == "__main__":

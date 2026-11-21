@@ -24,6 +24,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime
 import io
+import json
 import math
 import os
 import sys
@@ -782,6 +783,366 @@ class LumberBoard:
     @property
     def offcut_length(self) -> float:
         return max(0.0, self.stock_length - self.used_length)
+
+
+# ---------------------------------------------------------------------------
+# Estimator Data Models & Calculation Engine
+# ---------------------------------------------------------------------------
+
+DEFAULT_MATERIAL_DENSITIES: Dict[str, float] = {
+    "pine": 500.0,
+    "raw pine": 480.0,
+    "oak": 720.0,
+    "old wood": 680.0,
+    "bleached wood": 550.0,
+    "goldr rr": 600.0,
+    "birch": 670.0,
+    "light wood": 520.0,
+    "poplar": 450.0,
+    "plywood": 650.0,
+    "mdf": 750.0,
+    "particle board": 680.0,
+    "hardboard": 950.0,
+    "metal": 7850.0,
+    "steel": 7850.0,
+    "metal_brushed": 7850.0,
+    "aluminium": 2700.0,
+    "aluminum": 2700.0,
+    "default": 600.0,
+}
+
+DEFAULT_MATERIAL_PRICES: Dict[str, Tuple[str, float]] = {
+    # mat_key: (basis, default_unit_price)
+    # basis: "sheet", "volume" ($/m³), "area" ($/m²), "board", "linear" ($/m)
+    "poplar": ("sheet", 42.0),
+    "plywood": ("sheet", 48.0),
+    "mdf": ("sheet", 36.0),
+    "pine": ("volume", 650.0),      # $650 / m³ (~$1.53 / BF)
+    "raw pine": ("volume", 620.0),
+    "oak": ("volume", 1400.0),      # $1400 / m³ (~$3.30 / BF)
+    "old wood": ("volume", 800.0),
+    "bleached wood": ("volume", 750.0),
+    "goldr rr": ("volume", 850.0),
+    "metal_brushed": ("linear", 12.0), # $12 / m
+    "default": ("sheet", 45.0),
+}
+
+PRICING_BASIS_LABELS: Dict[str, str] = {
+    "sheet": "Per Full Sheet",
+    "volume": "Per Volume (m³ / BF)",
+    "area": "Per Area (m² / sq ft)",
+    "board": "Per Commercial Board",
+    "linear": "Per Linear Meter / Foot",
+}
+
+CURRENCY_SYMBOLS: List[str] = ["$", "€", "£", "Rp", "¥", "CHF", "kr", "R$", "₹"]
+
+
+def get_default_density(mat_name: str) -> float:
+    name_l = mat_name.lower()
+    for k, d in DEFAULT_MATERIAL_DENSITIES.items():
+        if k in name_l:
+            return d
+    return DEFAULT_MATERIAL_DENSITIES["default"]
+
+
+def get_default_pricing(mat_name: str, stock_type: str = "") -> Tuple[str, float]:
+    name_l = mat_name.lower()
+    for k, (b, p) in DEFAULT_MATERIAL_PRICES.items():
+        if k in name_l:
+            return b, p
+    is_solid = is_linear_stock(stock_type) or "solid" in stock_type.lower() or "lumber" in stock_type.lower()
+    if is_solid:
+        return "volume", 800.0
+    return "sheet", 45.0
+
+
+@dataclass
+class MaterialPricingConfig:
+    material_name: str
+    pricing_basis: str = "sheet"     # "sheet", "area", "volume", "board", "linear"
+    unit_price: float = 45.0
+    density_kg_m3: float = 600.0
+    waste_pct: float = 0.0           # Extra material waste allowance %
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pricing_basis": self.pricing_basis,
+            "unit_price": self.unit_price,
+            "density_kg_m3": self.density_kg_m3,
+            "waste_pct": self.waste_pct,
+        }
+
+    @classmethod
+    def from_dict(cls, mat_name: str, data: Dict[str, Any]) -> "MaterialPricingConfig":
+        return cls(
+            material_name=mat_name,
+            pricing_basis=str(data.get("pricing_basis", "sheet")),
+            unit_price=float(data.get("unit_price", 45.0)),
+            density_kg_m3=float(data.get("density_kg_m3", 600.0)),
+            waste_pct=float(data.get("waste_pct", 0.0)),
+        )
+
+
+@dataclass
+class EstimatorParameters:
+    currency_symbol: str = "$"
+    weight_unit: str = "kg"                     # "kg" or "lb"
+    estimation_mode: str = "raw_stock"          # "raw_stock" or "net_parts"
+    labor_hours: float = 0.0
+    labor_rate_hourly: float = 45.0
+    cutting_fee_per_sheet: float = 0.0          # Optional machining fee per sheet/board
+    edge_banding_price_per_m: float = 0.0
+    edge_banding_meters: float = 0.0
+    hardware_total: float = 0.0                 # Hinges, slides, screws, handles
+    finish_coating_total: float = 0.0           # Paint, stain, lacquer
+    shipping_delivery_total: float = 0.0
+    overhead_margin_pct: float = 15.0           # Profit / overhead margin %
+    tax_vat_pct: float = 0.0                    # Sales tax / VAT %
+
+
+@dataclass
+class MaterialEstimateLine:
+    material_name: str
+    stock_type: str
+    raw_units_count: int               # Sheets or Boards from nesting
+    raw_units_label: str               # "sheets" or "boards"
+    net_area_m2: float
+    rough_volume_m3: float
+    finished_volume_m3: float
+    total_length_m: float
+    pricing_basis: str                 # "sheet", "volume", "area", "board", "linear"
+    unit_price: float
+    material_cost: float
+    density_kg_m3: float
+    weight_kg: float
+    weight_display: str
+
+
+@dataclass
+class ProjectEstimateSummary:
+    material_lines: List[MaterialEstimateLine]
+    materials_cost_subtotal: float
+    labor_cost_subtotal: float
+    machining_cutting_subtotal: float
+    hardware_extras_subtotal: float
+    net_cost: float                            # Raw production cost
+    overhead_margin_amount: float              # Profit / overhead markup
+    tax_amount: float                          # Tax / VAT
+    total_project_quote: float                 # Final client quote / selling price
+    total_weight_kg: float
+    total_weight_display: str
+    currency_symbol: str
+    estimation_mode: str
+    weight_unit: str
+
+
+def get_estimator_pricing_file_path() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        p = Path(appdata) / "IngeTrazo" / "plugins" / "cutlist_pricing.json"
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return p
+    home = Path.home() / ".ingetrazo" / "plugins" / "cutlist_pricing.json"
+    try:
+        home.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return home
+
+
+def load_material_pricing_library() -> Dict[str, MaterialPricingConfig]:
+    p = get_estimator_pricing_file_path()
+    configs: Dict[str, MaterialPricingConfig] = {}
+    if p.exists():
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for mat_name, mdata in data.items():
+                    if isinstance(mdata, dict):
+                        configs[mat_name] = MaterialPricingConfig.from_dict(mat_name, mdata)
+        except Exception as e:
+            sys.stderr.write(f"[CutList] Error loading cutlist_pricing.json: {e}\n")
+    return configs
+
+
+def save_material_pricing_library(configs: Dict[str, MaterialPricingConfig]) -> bool:
+    p = get_estimator_pricing_file_path()
+    try:
+        data = {m: cfg.to_dict() for m, cfg in configs.items()}
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        sys.stderr.write(f"[CutList] Error saving cutlist_pricing.json: {e}\n")
+        return False
+
+
+def compute_project_estimate(
+    entries: List[CutListEntry],
+    material_types: Optional[Dict[str, str]] = None,
+    sheets_by_mat: Optional[Dict[str, List[SheetLayout]]] = None,
+    lumber_by_mat: Optional[Dict[str, List[LumberBoard]]] = None,
+    pricing_configs: Optional[Dict[str, MaterialPricingConfig]] = None,
+    params: Optional[EstimatorParameters] = None,
+) -> ProjectEstimateSummary:
+    mat_types = material_types or {}
+    sheets_dict = sheets_by_mat or {}
+    lumber_dict = lumber_by_mat or {}
+    p_configs = pricing_configs if pricing_configs is not None else {}
+    par = params or EstimatorParameters()
+
+    by_mat: Dict[str, List[CutListEntry]] = {}
+    for e in entries:
+        by_mat.setdefault(e.material, []).append(e)
+
+    lines: List[MaterialEstimateLine] = []
+    tot_materials_cost = 0.0
+    tot_weight_kg = 0.0
+    tot_machining_cost = 0.0
+
+    for mat_name in sorted(by_mat.keys()):
+        mat_entries = by_mat[mat_name]
+        st_info = mat_types.get(mat_name, "")
+        is_linear = is_linear_stock(st_info)
+
+        cfg = p_configs.get(mat_name)
+        if cfg is None:
+            def_basis, def_price = get_default_pricing(mat_name, st_info)
+            def_density = get_default_density(mat_name)
+            cfg = MaterialPricingConfig(
+                material_name=mat_name,
+                pricing_basis=def_basis,
+                unit_price=def_price,
+                density_kg_m3=def_density,
+            )
+            p_configs[mat_name] = cfg
+
+        net_area = sum(e.total_area for e in mat_entries)
+        rough_vol = sum(e.rough_total_volume for e in mat_entries)
+        fin_vol = sum(e.total_volume for e in mat_entries)
+        tot_len = sum(e.count * e.length for e in mat_entries)
+
+        if is_linear:
+            boards = lumber_dict.get(mat_name, [])
+            raw_count = len(boards) if boards else max(1, math.ceil(tot_len / 2.4))
+            raw_label = "boards"
+        else:
+            sheets = sheets_dict.get(mat_name, [])
+            std_sheet_area = 2.44 * 1.22
+            raw_count = len(sheets) if sheets else max(1, math.ceil(net_area / std_sheet_area))
+            raw_label = "sheets"
+
+        basis = cfg.pricing_basis
+        price = cfg.unit_price
+        waste_mult = 1.0 + (cfg.waste_pct / 100.0)
+
+        mat_cost = 0.0
+        if par.estimation_mode == "raw_stock":
+            if basis == "sheet":
+                mat_cost = raw_count * price
+            elif basis == "board":
+                mat_cost = raw_count * price
+            elif basis == "volume":
+                mat_cost = rough_vol * price * waste_mult
+            elif basis == "area":
+                mat_cost = net_area * price * waste_mult
+            elif basis == "linear":
+                mat_cost = tot_len * price * waste_mult
+            else:
+                mat_cost = raw_count * price
+        else:  # "net_parts"
+            if basis == "sheet":
+                std_sheet_area = 2.44 * 1.22
+                frac_sheets = (net_area / std_sheet_area) if std_sheet_area > 0 else 1.0
+                mat_cost = frac_sheets * price * waste_mult
+            elif basis == "board":
+                std_board_len = 2.4
+                frac_boards = (tot_len / std_board_len) if std_board_len > 0 else 1.0
+                mat_cost = frac_boards * price * waste_mult
+            elif basis == "volume":
+                mat_cost = fin_vol * price * waste_mult
+            elif basis == "area":
+                mat_cost = net_area * price * waste_mult
+            elif basis == "linear":
+                mat_cost = tot_len * price * waste_mult
+            else:
+                mat_cost = net_area * price * waste_mult
+
+        if par.cutting_fee_per_sheet > 0:
+            tot_machining_cost += raw_count * par.cutting_fee_per_sheet
+
+        vol_for_weight = rough_vol if is_linear else fin_vol
+        mat_weight_kg = vol_for_weight * cfg.density_kg_m3
+        tot_weight_kg += mat_weight_kg
+
+        if par.weight_unit == "lb":
+            weight_val = mat_weight_kg * 2.20462
+            w_disp = f"{weight_val:.1f} lb"
+        else:
+            w_disp = f"{mat_weight_kg:.1f} kg"
+
+        tot_materials_cost += mat_cost
+
+        lines.append(MaterialEstimateLine(
+            material_name=mat_name,
+            stock_type=st_info,
+            raw_units_count=raw_count,
+            raw_units_label=raw_label,
+            net_area_m2=net_area,
+            rough_volume_m3=rough_vol,
+            finished_volume_m3=fin_vol,
+            total_length_m=tot_len,
+            pricing_basis=basis,
+            unit_price=price,
+            material_cost=mat_cost,
+            density_kg_m3=cfg.density_kg_m3,
+            weight_kg=mat_weight_kg,
+            weight_display=w_disp,
+        ))
+
+    labor_subtotal = par.labor_hours * par.labor_rate_hourly
+    edge_banding_subtotal = par.edge_banding_meters * par.edge_banding_price_per_m
+    machining_subtotal = tot_machining_cost + edge_banding_subtotal
+
+    hardware_extras = (
+        par.hardware_total +
+        par.finish_coating_total +
+        par.shipping_delivery_total
+    )
+
+    net_cost = tot_materials_cost + labor_subtotal + machining_subtotal + hardware_extras
+    margin_amount = net_cost * (par.overhead_margin_pct / 100.0)
+    subtotal_with_margin = net_cost + margin_amount
+    tax_amount = subtotal_with_margin * (par.tax_vat_pct / 100.0)
+    total_quote = subtotal_with_margin + tax_amount
+
+    if par.weight_unit == "lb":
+        tot_weight_val = tot_weight_kg * 2.20462
+        tot_w_disp = f"{tot_weight_val:.1f} lb"
+    else:
+        tot_w_disp = f"{tot_weight_kg:.1f} kg"
+
+    return ProjectEstimateSummary(
+        material_lines=lines,
+        materials_cost_subtotal=tot_materials_cost,
+        labor_cost_subtotal=labor_subtotal,
+        machining_cutting_subtotal=machining_subtotal,
+        hardware_extras_subtotal=hardware_extras,
+        net_cost=net_cost,
+        overhead_margin_amount=margin_amount,
+        tax_amount=tax_amount,
+        total_project_quote=total_quote,
+        total_weight_kg=tot_weight_kg,
+        total_weight_display=tot_w_disp,
+        currency_symbol=par.currency_symbol,
+        estimation_mode=par.estimation_mode,
+        weight_unit=par.weight_unit,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2178,6 +2539,322 @@ def render_cutlist_pdf(
         y += h_gap
 
     draw_page_footer(curr_page)
+    p.end()
+
+
+def render_estimate_pdf(
+    path: str,
+    summary: ProjectEstimateSummary,
+    project_name: str = "",
+    viewport: Any = None,
+    unit: str = "mm",
+) -> None:
+    """Renders the OpenCutList-styled Commercial Estimate & Client Quote PDF document."""
+    if not QT_AVAILABLE:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("%PDF-1.4\n")
+            f.write(f"% OpenCutList Estimate & Quote — {project_name or get_project_name(viewport)}\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"COMMERCIAL ESTIMATE & QUOTE ({summary.currency_symbol})\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Mode: {summary.estimation_mode}  |  Weight: {summary.total_weight_display}\n")
+            f.write("-" * 80 + "\n")
+            for idx, line in enumerate(summary.material_lines, start=1):
+                f.write(f"{idx}. {line.material_name} ({line.stock_type}): {line.raw_units_count} {line.raw_units_label} @ {summary.currency_symbol}{line.unit_price:.2f} [{line.pricing_basis}] = {summary.currency_symbol}{line.material_cost:.2f} ({line.weight_display})\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Materials Subtotal:      {summary.currency_symbol}{summary.materials_cost_subtotal:.2f}\n")
+            f.write(f"Labor & Operations:      {summary.currency_symbol}{summary.labor_cost_subtotal + summary.machining_cutting_subtotal:.2f}\n")
+            f.write(f"Hardware & Extras:       {summary.currency_symbol}{summary.hardware_extras_subtotal:.2f}\n")
+            f.write(f"Net Production Cost:     {summary.currency_symbol}{summary.net_cost:.2f}\n")
+            f.write(f"Overhead / Margin:       {summary.currency_symbol}{summary.overhead_margin_amount:.2f}\n")
+            f.write(f"Tax / VAT:               {summary.currency_symbol}{summary.tax_amount:.2f}\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"GRAND TOTAL QUOTE:       {summary.currency_symbol}{summary.total_project_quote:.2f}\n")
+            f.write(f"TOTAL ESTIMATED WEIGHT:  {summary.total_weight_display}\n")
+            f.write("=" * 80 + "\n")
+        return
+
+    pdf = QPdfWriter(path)
+    pdf.setPageSize(QPageSize(QPageSize.A4))
+    pdf.setPageOrientation(QPageLayout.Portrait)
+    pdf.setResolution(300)
+
+    page_w = float(pdf.width())
+    page_h = float(pdf.height())
+    dpi = float(pdf.resolution())
+    scale = dpi / 72.0
+
+    margin_x = 15.0 / 25.4 * dpi
+    margin_y = 15.0 / 25.4 * dpi
+    content_w = page_w - 2.0 * margin_x
+    content_bottom = page_h - margin_y - 20.0 * scale
+
+    h_top = 28.0 * scale
+    h_doc = 22.0 * scale
+    h_bar = 22.0 * scale
+    h_th = 22.0 * scale
+    h_row = 19.0 * scale
+    h_gap = 14.0 * scale
+
+    p = QPainter(pdf)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+    font_title = QFont("Arial", 18)
+    font_title.setBold(True)
+    font_meta = QFont("Arial", 9)
+    font_doc = QFont("Arial", 11)
+    font_section = QFont("Arial", 10)
+    font_section.setBold(True)
+    font_th = QFont("Arial", 8.5)
+    font_th.setBold(True)
+    font_cell = QFont("Arial", 8.5)
+    font_cell_bold = QFont("Arial", 8.5)
+    font_cell_bold.setBold(True)
+    font_card_num = QFont("Arial", 12)
+    font_card_num.setBold(True)
+    font_card_lbl = QFont("Arial", 7.5)
+    font_footer = QFont("Arial", 8)
+
+    border_pen = QPen(QColor("#000000"), max(1.0, 0.75 * scale))
+    curr = summary.currency_symbol
+
+    def draw_footer(page_num: int):
+        p.save()
+        p.setFont(font_footer)
+        p.setPen(QColor("#64748b"))
+        foot_y = page_h - margin_y
+        p.drawText(QRectF(margin_x, foot_y, content_w / 2.0, 16.0 * scale), Qt.AlignVCenter | Qt.AlignLeft, "IngeTrazo — OpenCutList Cost Estimator")
+        p.drawText(QRectF(margin_x + content_w / 2.0, foot_y, content_w / 2.0, 16.0 * scale), Qt.AlignVCenter | Qt.AlignRight, f"Page {page_num}")
+        p.restore()
+
+    y = margin_y
+    curr_page = 1
+
+    # Header
+    p.save()
+    p.setFont(font_title)
+    p.setPen(QColor("#111827"))
+    p.drawText(QRectF(margin_x, y, content_w * 0.55, h_top), Qt.AlignVCenter | Qt.AlignLeft, "Commercial Estimate & Quote")
+
+    now = datetime.now()
+    hr = now.hour % 12 or 12
+    dt_str = f"{now.strftime('%m/%d/%Y')} {hr}:{now.strftime('%M')}{now.strftime('%p').lower()}"
+    mode_str = "Commercial Raw Stock" if summary.estimation_mode == "raw_stock" else "Net Part Usage"
+    meta_str = f"{dt_str}  |  {mode_str}"
+
+    p.setFont(font_meta)
+    p.setPen(QColor("#111827"))
+    p.drawText(QRectF(margin_x + content_w * 0.45, y, content_w * 0.55, h_top), Qt.AlignVCenter | Qt.AlignRight, meta_str)
+    p.restore()
+    y += h_top + 6.0 * scale
+
+    # Document Name Box
+    p.save()
+    p.setPen(border_pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(QRectF(margin_x, y, content_w, h_doc))
+    p.setFont(font_doc)
+    p.setPen(QColor("#111827"))
+    p_name = project_name or get_project_name(viewport)
+    p.drawText(QRectF(margin_x, y, content_w, h_doc), Qt.AlignCenter, p_name)
+    p.restore()
+    y += h_doc + h_gap
+
+    # 4 Metric Cards
+    card_gap = 8.0 * scale
+    card_w = (content_w - (3 * card_gap)) / 4.0
+    card_h = 36.0 * scale
+
+    cards_data = [
+        ("MATERIALS SUBTOTAL", f"{curr}{summary.materials_cost_subtotal:,.2f}", "#0284c7"),
+        ("LABOR & OPERATIONS", f"{curr}{summary.labor_cost_subtotal + summary.machining_cutting_subtotal:,.2f}", "#0f766e"),
+        ("ESTIMATED WEIGHT", summary.total_weight_display, "#d97706"),
+        ("FINAL QUOTE PRICE", f"{curr}{summary.total_project_quote:,.2f}", "#16a34a"),
+    ]
+
+    for c_i, (lbl, val, col_hex) in enumerate(cards_data):
+        cx = margin_x + c_i * (card_w + card_gap)
+        c_rect = QRectF(cx, y, card_w, card_h)
+        p.save()
+        p.setPen(border_pen)
+        p.setBrush(QColor("#f8fafc"))
+        p.drawRoundedRect(c_rect, 3.0 * scale, 3.0 * scale)
+        p.setFont(font_card_lbl)
+        p.setPen(QColor("#64748b"))
+        p.drawText(QRectF(cx + 6.0 * scale, y + 4.0 * scale, card_w - 12.0 * scale, 12.0 * scale), Qt.AlignLeft, lbl)
+        p.setFont(font_card_num)
+        p.setPen(QColor(col_hex))
+        p.drawText(QRectF(cx + 6.0 * scale, y + 16.0 * scale, card_w - 12.0 * scale, 16.0 * scale), Qt.AlignLeft | Qt.AlignVCenter, val)
+        p.restore()
+
+    y += card_h + h_gap
+
+    # Section 1: Materials Breakdown Table
+    p.save()
+    p.setPen(border_pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(QRectF(margin_x, y, content_w, h_bar))
+    p.setFont(font_section)
+    p.setPen(QColor("#111827"))
+    p.drawText(QRectF(margin_x + 8.0 * scale, y, content_w - 16.0 * scale, h_bar), Qt.AlignVCenter | Qt.AlignLeft, "1. Materials Breakdown")
+    p.restore()
+    y += h_bar
+
+    # Table columns
+    W = content_w
+    w_m0 = round(W * 0.05)   # #
+    w_m1 = round(W * 0.35)   # Material
+    w_m2 = round(W * 0.16)   # Commercial Quantity
+    w_m3 = round(W * 0.14)   # Pricing Basis
+    w_m4 = round(W * 0.10)   # Unit Rate
+    w_m5 = round(W * 0.10)   # Total Cost
+    w_m6 = W - (w_m0 + w_m1 + w_m2 + w_m3 + w_m4 + w_m5)  # Weight
+
+    x_m0 = margin_x
+    x_m1 = x_m0 + w_m0
+    x_m2 = x_m1 + w_m1
+    x_m3 = x_m2 + w_m2
+    x_m4 = x_m3 + w_m3
+    x_m5 = x_m4 + w_m4
+    x_m6 = x_m5 + w_m5
+
+    p.save()
+    p.setPen(border_pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(QRectF(margin_x, y, content_w, h_th))
+    p.drawLine(QPointF(x_m1, y), QPointF(x_m1, y + h_th))
+    p.drawLine(QPointF(x_m2, y), QPointF(x_m2, y + h_th))
+    p.drawLine(QPointF(x_m3, y), QPointF(x_m3, y + h_th))
+    p.drawLine(QPointF(x_m4, y), QPointF(x_m4, y + h_th))
+    p.drawLine(QPointF(x_m5, y), QPointF(x_m5, y + h_th))
+    p.drawLine(QPointF(x_m6, y), QPointF(x_m6, y + h_th))
+
+    p.setFont(font_th)
+    p.setPen(QColor("#111827"))
+    p.drawText(QRectF(x_m0, y, w_m0, h_th), Qt.AlignCenter, "#")
+    p.drawText(QRectF(x_m1 + 6.0 * scale, y, w_m1 - 12.0 * scale, h_th), Qt.AlignVCenter | Qt.AlignLeft, "Material")
+    p.drawText(QRectF(x_m2, y, w_m2, h_th), Qt.AlignCenter, "Quantity / Commercial Units")
+    p.drawText(QRectF(x_m3, y, w_m3, h_th), Qt.AlignCenter, "Basis")
+    p.drawText(QRectF(x_m4, y, w_m4, h_th), Qt.AlignCenter, f"Rate ({curr})")
+    p.drawText(QRectF(x_m5, y, w_m5, h_th), Qt.AlignCenter, f"Cost ({curr})")
+    p.drawText(QRectF(x_m6, y, w_m6, h_th), Qt.AlignCenter, "Weight")
+    p.restore()
+    y += h_th
+
+    # Rows
+    for idx, line in enumerate(summary.material_lines, start=1):
+        if y + h_row > content_bottom:
+            draw_footer(curr_page)
+            pdf.newPage()
+            curr_page += 1
+            y = margin_y
+
+        p.save()
+        p.setPen(border_pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(margin_x, y, content_w, h_row))
+        p.drawLine(QPointF(x_m1, y), QPointF(x_m1, y + h_row))
+        p.drawLine(QPointF(x_m2, y), QPointF(x_m2, y + h_row))
+        p.drawLine(QPointF(x_m3, y), QPointF(x_m3, y + h_row))
+        p.drawLine(QPointF(x_m4, y), QPointF(x_m4, y + h_row))
+        p.drawLine(QPointF(x_m5, y), QPointF(x_m5, y + h_row))
+        p.drawLine(QPointF(x_m6, y), QPointF(x_m6, y + h_row))
+
+        p.setFont(font_cell)
+        p.setPen(QColor("#111827"))
+        p.drawText(QRectF(x_m0, y, w_m0, h_row), Qt.AlignCenter, str(idx))
+        p.drawText(QRectF(x_m1 + 6.0 * scale, y, w_m1 - 12.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignLeft, line.material_name)
+        qty_str = f"{line.raw_units_count} {line.raw_units_label}"
+        p.drawText(QRectF(x_m2, y, w_m2, h_row), Qt.AlignCenter, qty_str)
+        p.drawText(QRectF(x_m3, y, w_m3, h_row), Qt.AlignCenter, PRICING_BASIS_LABELS.get(line.pricing_basis, line.pricing_basis))
+        p.drawText(QRectF(x_m4, y, w_m4, h_row), Qt.AlignCenter, f"{curr}{line.unit_price:.2f}")
+        p.setFont(font_cell_bold)
+        p.drawText(QRectF(x_m5, y, w_m5, h_row), Qt.AlignCenter, f"{curr}{line.material_cost:.2f}")
+        p.setFont(font_cell)
+        p.drawText(QRectF(x_m6, y, w_m6, h_row), Qt.AlignCenter, line.weight_display)
+        p.restore()
+        y += h_row
+
+    y += h_gap
+
+    # Section 2: Operations, Hardware & Financial Summary
+    if y + h_bar + 4 * h_row > content_bottom:
+        draw_footer(curr_page)
+        pdf.newPage()
+        curr_page += 1
+        y = margin_y
+
+    p.save()
+    p.setPen(border_pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(QRectF(margin_x, y, content_w, h_bar))
+    p.setFont(font_section)
+    p.setPen(QColor("#111827"))
+    p.drawText(QRectF(margin_x + 8.0 * scale, y, content_w - 16.0 * scale, h_bar), Qt.AlignVCenter | Qt.AlignLeft, "2. Operations, Hardware & Financial Summary")
+    p.restore()
+    y += h_bar
+
+    half_w = (content_w - card_gap) / 2.0
+    left_x = margin_x
+    right_x = margin_x + half_w + card_gap
+
+    op_lines = [
+        ("Materials Subtotal", f"{curr}{summary.materials_cost_subtotal:.2f}"),
+        ("Labor Cost", f"{curr}{summary.labor_cost_subtotal:.2f}"),
+        ("Cutting & Machining Fee", f"{curr}{summary.machining_cutting_subtotal:.2f}"),
+        ("Hardware & Fasteners", f"{curr}{summary.hardware_extras_subtotal:.2f}"),
+    ]
+
+    p.save()
+    p.setPen(border_pen)
+    p.setBrush(Qt.NoBrush)
+    box_h = len(op_lines) * h_row
+    p.drawRect(QRectF(left_x, y, half_w, box_h))
+    for i, (label, val) in enumerate(op_lines):
+        row_y = y + i * h_row
+        if i > 0:
+            p.drawLine(QPointF(left_x, row_y), QPointF(left_x + half_w, row_y))
+        p.setFont(font_cell)
+        p.setPen(QColor("#475569"))
+        p.drawText(QRectF(left_x + 8.0 * scale, row_y, half_w * 0.6, h_row), Qt.AlignVCenter | Qt.AlignLeft, label)
+        p.setFont(font_cell_bold)
+        p.setPen(QColor("#111827"))
+        p.drawText(QRectF(left_x + half_w * 0.6, row_y, half_w * 0.4 - 8.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignRight, val)
+    p.restore()
+
+    fin_lines = [
+        ("Net Production Cost", f"{curr}{summary.net_cost:.2f}", False),
+        ("Overhead & Margin Markup", f"{curr}{summary.overhead_margin_amount:.2f}", False),
+        ("Sales Tax / VAT", f"{curr}{summary.tax_amount:.2f}", False),
+        ("FINAL CLIENT QUOTE", f"{curr}{summary.total_project_quote:,.2f}", True),
+    ]
+
+    p.save()
+    p.setPen(border_pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(QRectF(right_x, y, half_w, box_h))
+    for i, (label, val, is_grand) in enumerate(fin_lines):
+        row_y = y + i * h_row
+        if i > 0:
+            p.drawLine(QPointF(right_x, row_y), QPointF(right_x + half_w, row_y))
+        if is_grand:
+            p.fillRect(QRectF(right_x + 1, row_y + 1, half_w - 2, h_row - 2), QBrush(QColor("#dcfce7")))
+            p.setFont(font_card_num)
+            p.setPen(QColor("#15803d"))
+            p.drawText(QRectF(right_x + 8.0 * scale, row_y, half_w * 0.55, h_row), Qt.AlignVCenter | Qt.AlignLeft, label)
+            p.drawText(QRectF(right_x + half_w * 0.55, row_y, half_w * 0.45 - 8.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignRight, val)
+        else:
+            p.setFont(font_cell)
+            p.setPen(QColor("#475569"))
+            p.drawText(QRectF(right_x + 8.0 * scale, row_y, half_w * 0.6, h_row), Qt.AlignVCenter | Qt.AlignLeft, label)
+            p.setFont(font_cell_bold)
+            p.setPen(QColor("#111827"))
+            p.drawText(QRectF(right_x + half_w * 0.6, row_y, half_w * 0.4 - 8.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignRight, val)
+    p.restore()
+
+    y += box_h + h_gap
+    draw_footer(curr_page)
     p.end()
 
 
@@ -3839,10 +4516,12 @@ if QT_AVAILABLE:
             self._sort_col: int = 10  # Default: Rough Thickness (Column 10 in 13-column 'both' table)
             self._sort_asc: bool = False  # Default: Descending (thickest first)
             self._thumbnail_cache: Dict[str, Tuple[Any, Any]] = {}
+            self.pricing_configs: Dict[str, MaterialPricingConfig] = load_material_pricing_library()
+            self.current_estimate_summary: Optional[ProjectEstimateSummary] = None
 
             self.setWindowTitle("Cut List — IngeTrazo")
-            self.setMinimumSize(960, 680)
-            self.resize(1040, 720)
+            self.setMinimumSize(980, 700)
+            self.resize(1080, 740)
 
             self._build_ui()
             self._load_selection()
@@ -4174,6 +4853,241 @@ if QT_AVAILABLE:
             te_layout.addWidget(self.drawing_widget, stretch=1)
 
             self.tabs.addTab(tab_exploded, "🎨 Exploded Drawing")
+
+            # TAB 4: Cost & Weight Estimator
+            tab_estimate = QWidget()
+            test_layout = QVBoxLayout(tab_estimate)
+            test_layout.setContentsMargins(6, 8, 6, 6)
+            test_layout.setSpacing(8)
+
+            # 1. Top Controls Bar: Currency, Mode, Weight Unit, Defaults
+            est_top_bar = QHBoxLayout()
+            est_top_bar.addWidget(QLabel("<b>Currency:</b>"))
+            self.est_currency_combo = QComboBox()
+            self.est_currency_combo.addItems(CURRENCY_SYMBOLS)
+            self.est_currency_combo.setCurrentText("$")
+            self.est_currency_combo.currentTextChanged.connect(self._on_estimator_param_changed)
+            est_top_bar.addWidget(self.est_currency_combo)
+
+            est_top_bar.addWidget(QLabel("<b>Estimation Mode:</b>"))
+            self.est_mode_combo = QComboBox()
+            self.est_mode_combo.addItem("Commercial Raw Stock (Nesting Sheets & Boards)", "raw_stock")
+            self.est_mode_combo.addItem("Net Part Dimensions (+Waste %)", "net_parts")
+            self.est_mode_combo.currentIndexChanged.connect(self._on_estimator_param_changed)
+            est_top_bar.addWidget(self.est_mode_combo, stretch=1)
+
+            est_top_bar.addWidget(QLabel("<b>Weight Unit:</b>"))
+            self.est_weight_unit_combo = QComboBox()
+            self.est_weight_unit_combo.addItems(["kg", "lb"])
+            self.est_weight_unit_combo.setCurrentText("kg")
+            self.est_weight_unit_combo.currentTextChanged.connect(self._on_estimator_param_changed)
+            est_top_bar.addWidget(self.est_weight_unit_combo)
+
+            self.save_price_defaults_btn = QPushButton("💾 Save Prices as Defaults")
+            self.save_price_defaults_btn.setToolTip("Save current material prices and densities to your local library (%APPDATA%\\IngeTrazo\\plugins\\cutlist_pricing.json)")
+            self.save_price_defaults_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #1e293b;
+                    color: #f1f5f9;
+                    border: 1px solid #475569;
+                    border-radius: 4px;
+                    padding: 4px 10px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #334155;
+                    border-color: #38bdf8;
+                    color: #ffffff;
+                }
+            """)
+            self.save_price_defaults_btn.clicked.connect(self._save_pricing_defaults)
+            est_top_bar.addWidget(self.save_price_defaults_btn)
+
+            test_layout.addLayout(est_top_bar)
+
+            # 2. Main Content Splitter: Materials Pricing Table on Left, Operations on Right
+            est_body_split = QSplitter(Qt.Horizontal)
+
+            # Left: Material Pricing Table
+            mat_pricing_box = QGroupBox("Material Pricing & Density")
+            mat_pricing_layout = QVBoxLayout(mat_pricing_box)
+            mat_pricing_layout.setContentsMargins(6, 8, 6, 6)
+
+            self.est_materials_table = QTableWidget()
+            self.est_materials_table.setColumnCount(7)
+            self.est_materials_table.setHorizontalHeaderLabels([
+                "Material", "Stock Type", "Pricing Basis", "Unit Price", "Density (kg/m³)", "Subtotal Cost", "Weight"
+            ])
+            self.est_materials_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            for c_idx in range(1, 7):
+                self.est_materials_table.horizontalHeader().setSectionResizeMode(c_idx, QHeaderView.ResizeToContents)
+            self.est_materials_table.verticalHeader().setVisible(False)
+            self.est_materials_table.setAlternatingRowColors(True)
+            mat_pricing_layout.addWidget(self.est_materials_table)
+            est_body_split.addWidget(mat_pricing_box)
+
+            # Right: Workshop & Extra Costs Form
+            extra_box = QGroupBox("Operations, Hardware & Markups")
+            extra_layout = QFormLayout(extra_box)
+            extra_layout.setContentsMargins(10, 10, 10, 10)
+            extra_layout.setSpacing(6)
+
+            # Labor
+            labor_h_box = QHBoxLayout()
+            self.est_labor_hours_spin = QDoubleSpinBox()
+            self.est_labor_hours_spin.setRange(0.0, 1000.0)
+            self.est_labor_hours_spin.setValue(0.0)
+            self.est_labor_hours_spin.setSuffix(" hrs")
+            self.est_labor_hours_spin.valueChanged.connect(self._on_estimator_param_changed)
+
+            self.est_labor_rate_spin = QDoubleSpinBox()
+            self.est_labor_rate_spin.setRange(0.0, 1000.0)
+            self.est_labor_rate_spin.setValue(45.0)
+            self.est_labor_rate_spin.setPrefix("$ ")
+            self.est_labor_rate_spin.valueChanged.connect(self._on_estimator_param_changed)
+
+            labor_h_box.addWidget(self.est_labor_hours_spin)
+            labor_h_box.addWidget(QLabel("@"))
+            labor_h_box.addWidget(self.est_labor_rate_spin)
+            extra_layout.addRow("Workshop Labor:", labor_h_box)
+
+            # Machining / Cutting fee
+            self.est_cutting_fee_spin = QDoubleSpinBox()
+            self.est_cutting_fee_spin.setRange(0.0, 500.0)
+            self.est_cutting_fee_spin.setValue(0.0)
+            self.est_cutting_fee_spin.setPrefix("$ ")
+            self.est_cutting_fee_spin.setToolTip("Optional cutting/panel sizing fee per raw commercial sheet/board")
+            self.est_cutting_fee_spin.valueChanged.connect(self._on_estimator_param_changed)
+            extra_layout.addRow("Cutting Fee (per unit):", self.est_cutting_fee_spin)
+
+            # Edge banding
+            eb_h_box = QHBoxLayout()
+            self.est_edge_meters_spin = QDoubleSpinBox()
+            self.est_edge_meters_spin.setRange(0.0, 1000.0)
+            self.est_edge_meters_spin.setValue(0.0)
+            self.est_edge_meters_spin.setSuffix(" m")
+            self.est_edge_meters_spin.valueChanged.connect(self._on_estimator_param_changed)
+
+            self.est_edge_price_spin = QDoubleSpinBox()
+            self.est_edge_price_spin.setRange(0.0, 100.0)
+            self.est_edge_price_spin.setValue(1.50)
+            self.est_edge_price_spin.setPrefix("$ ")
+            self.est_edge_price_spin.valueChanged.connect(self._on_estimator_param_changed)
+
+            eb_h_box.addWidget(self.est_edge_meters_spin)
+            eb_h_box.addWidget(QLabel("@"))
+            eb_h_box.addWidget(self.est_edge_price_spin)
+            extra_layout.addRow("Edge Banding:", eb_h_box)
+
+            # Hardware & Fasteners
+            self.est_hardware_spin = QDoubleSpinBox()
+            self.est_hardware_spin.setRange(0.0, 100000.0)
+            self.est_hardware_spin.setValue(0.0)
+            self.est_hardware_spin.setPrefix("$ ")
+            self.est_hardware_spin.setToolTip("Total cost for hinges, slides, knobs, screws, and fittings")
+            self.est_hardware_spin.valueChanged.connect(self._on_estimator_param_changed)
+            extra_layout.addRow("Hardware & Fasteners:", self.est_hardware_spin)
+
+            # Finishing / Coating
+            self.est_finishing_spin = QDoubleSpinBox()
+            self.est_finishing_spin.setRange(0.0, 100000.0)
+            self.est_finishing_spin.setValue(0.0)
+            self.est_finishing_spin.setPrefix("$ ")
+            self.est_finishing_spin.setToolTip("Stain, lacquer, polyurethane, or paint")
+            self.est_finishing_spin.valueChanged.connect(self._on_estimator_param_changed)
+            extra_layout.addRow("Finishing & Coatings:", self.est_finishing_spin)
+
+            # Shipping / Delivery
+            self.est_shipping_spin = QDoubleSpinBox()
+            self.est_shipping_spin.setRange(0.0, 100000.0)
+            self.est_shipping_spin.setValue(0.0)
+            self.est_shipping_spin.setPrefix("$ ")
+            self.est_shipping_spin.valueChanged.connect(self._on_estimator_param_changed)
+            extra_layout.addRow("Shipping / Delivery:", self.est_shipping_spin)
+
+            # Overhead & Profit Margin %
+            self.est_margin_spin = QDoubleSpinBox()
+            self.est_margin_spin.setRange(0.0, 500.0)
+            self.est_margin_spin.setValue(15.0)
+            self.est_margin_spin.setSuffix(" %")
+            self.est_margin_spin.setToolTip("Shop overhead and profit markup applied to net production cost")
+            self.est_margin_spin.valueChanged.connect(self._on_estimator_param_changed)
+            extra_layout.addRow("Overhead & Margin:", self.est_margin_spin)
+
+            # Tax / VAT %
+            self.est_tax_spin = QDoubleSpinBox()
+            self.est_tax_spin.setRange(0.0, 100.0)
+            self.est_tax_spin.setValue(0.0)
+            self.est_tax_spin.setSuffix(" %")
+            self.est_tax_spin.valueChanged.connect(self._on_estimator_param_changed)
+            extra_layout.addRow("Sales Tax / VAT:", self.est_tax_spin)
+
+            est_body_split.addWidget(extra_box)
+            est_body_split.setStretchFactor(0, 3)
+            est_body_split.setStretchFactor(1, 2)
+            test_layout.addWidget(est_body_split, stretch=1)
+
+            # 3. Executive Summary Cards (6 Cards)
+            cards_frame = QFrame()
+            cards_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #0f172a;
+                    border: 1px solid #334155;
+                    border-radius: 6px;
+                    padding: 4px;
+                }
+            """)
+            cards_layout = QHBoxLayout(cards_frame)
+            cards_layout.setContentsMargins(6, 6, 6, 6)
+            cards_layout.setSpacing(10)
+
+            def make_card(title: str, text_color: str = "#f8fafc"):
+                card = QFrame()
+                card.setStyleSheet("background-color: #1e293b; border-radius: 4px; border: 1px solid #334155; padding: 4px;")
+                cl = QVBoxLayout(card)
+                cl.setContentsMargins(4, 4, 4, 4)
+                cl.setSpacing(2)
+                t_lbl = QLabel(title)
+                t_lbl.setStyleSheet("color: #94a3b8; font-size: 10px; font-weight: bold;")
+                v_lbl = QLabel("$ 0.00")
+                v_lbl.setStyleSheet(f"color: {text_color}; font-size: 13px; font-weight: bold;")
+                cl.addWidget(t_lbl)
+                cl.addWidget(v_lbl)
+                return card, v_lbl
+
+            card_mat, self.card_mat_val = make_card("📦 MATERIALS", "#38bdf8")
+            card_lab, self.card_lab_val = make_card("🔨 LABOR & OPS", "#2dd4bf")
+            card_extra, self.card_extra_val = make_card("🔩 EXTRAS", "#fbbf24")
+            card_wt, self.card_wt_val = make_card("⚖️ TOTAL WEIGHT", "#f97316")
+            card_net, self.card_net_val = make_card("💵 NET COST", "#e2e8f0")
+            card_quote, self.card_quote_val = make_card("🏷️ FINAL QUOTE PRICE", "#4ade80")
+
+            cards_layout.addWidget(card_mat)
+            cards_layout.addWidget(card_lab)
+            cards_layout.addWidget(card_extra)
+            cards_layout.addWidget(card_wt)
+            cards_layout.addWidget(card_net)
+            cards_layout.addWidget(card_quote)
+
+            test_layout.addWidget(cards_frame)
+
+            # 4. Action Buttons Bar
+            est_actions = QHBoxLayout()
+            self.copy_quote_btn = QPushButton("📋 Copy Quote (TSV)")
+            self.copy_quote_btn.clicked.connect(self._copy_estimate_tsv)
+            est_actions.addWidget(self.copy_quote_btn)
+
+            self.export_estimate_csv_btn = QPushButton("💾 Export Estimate CSV...")
+            self.export_estimate_csv_btn.clicked.connect(self._export_estimate_csv)
+            est_actions.addWidget(self.export_estimate_csv_btn)
+
+            self.print_estimate_pdf_btn = QPushButton("📄 Print Estimate PDF...")
+            self.print_estimate_pdf_btn.setToolTip("Export OpenCutList-styled Commercial Quote & Estimate PDF")
+            self.print_estimate_pdf_btn.clicked.connect(self._export_estimate_pdf)
+            est_actions.addWidget(self.print_estimate_pdf_btn)
+
+            test_layout.addLayout(est_actions)
+            self.tabs.addTab(tab_estimate, "💰 Estimate")
             self.tabs.currentChanged.connect(self._on_tab_changed)
             main_layout.addWidget(self.tabs, stretch=1)
 
@@ -4211,6 +5125,9 @@ if QT_AVAILABLE:
         def _on_tab_changed(self, idx: int) -> None:
             if idx == 2 and hasattr(self, "drawing_widget"):
                 self.drawing_widget.update_3d_render(full_res=True, refresh_cad=True)
+            elif idx == 3 and hasattr(self, "_populate_estimator_tab"):
+                self._populate_estimator_tab()
+                self._recalculate_estimate()
 
         def closeEvent(self, event: Any) -> None:
             vp = self.viewport
@@ -4458,6 +5375,11 @@ if QT_AVAILABLE:
             # 6. Console Output
             print(format_console_table(self.entries, unit=u))
             sys.stdout.flush()
+
+            # 7. Update Estimator
+            if hasattr(self, "_populate_estimator_tab"):
+                self._populate_estimator_tab()
+                self._recalculate_estimate()
 
         def _on_thick_sort_changed(self) -> None:
             mode = getattr(self, "table_view_mode", "both")
@@ -4803,6 +5725,11 @@ if QT_AVAILABLE:
 
             # Refresh Table (regrouped!)
             self._apply_table_filter()
+
+            # Refresh Estimator
+            if hasattr(self, "_populate_estimator_tab"):
+                self._populate_estimator_tab()
+                self._recalculate_estimate()
 
         def _populate_table(self, entries: List[CutListEntry]) -> None:
             u = self.unit_combo.currentText()
@@ -5293,6 +6220,302 @@ if QT_AVAILABLE:
                     p.end()
                     pix.save(path, "PDF")
                     QMessageBox.information(self, "Complete", f"Exploded drawing PDF saved to:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export PDF:\n{e}")
+
+        # -------------------------------------------------------------------
+        # Cost & Weight Estimator Methods
+        # -------------------------------------------------------------------
+        def _get_active_estimator_params(self) -> EstimatorParameters:
+            curr = self.est_currency_combo.currentText() if hasattr(self, "est_currency_combo") else "$"
+            mode_data = self.est_mode_combo.currentData() if hasattr(self, "est_mode_combo") else "raw_stock"
+            wt_unit = self.est_weight_unit_combo.currentText() if hasattr(self, "est_weight_unit_combo") else "kg"
+            return EstimatorParameters(
+                currency_symbol=curr,
+                weight_unit=wt_unit,
+                estimation_mode=mode_data or "raw_stock",
+                labor_hours=self.est_labor_hours_spin.value() if hasattr(self, "est_labor_hours_spin") else 0.0,
+                labor_rate_hourly=self.est_labor_rate_spin.value() if hasattr(self, "est_labor_rate_spin") else 45.0,
+                cutting_fee_per_sheet=self.est_cutting_fee_spin.value() if hasattr(self, "est_cutting_fee_spin") else 0.0,
+                edge_banding_price_per_m=self.est_edge_price_spin.value() if hasattr(self, "est_edge_price_spin") else 1.5,
+                edge_banding_meters=self.est_edge_meters_spin.value() if hasattr(self, "est_edge_meters_spin") else 0.0,
+                hardware_total=self.est_hardware_spin.value() if hasattr(self, "est_hardware_spin") else 0.0,
+                finish_coating_total=self.est_finishing_spin.value() if hasattr(self, "est_finishing_spin") else 0.0,
+                shipping_delivery_total=self.est_shipping_spin.value() if hasattr(self, "est_shipping_spin") else 0.0,
+                overhead_margin_pct=self.est_margin_spin.value() if hasattr(self, "est_margin_spin") else 15.0,
+                tax_vat_pct=self.est_tax_spin.value() if hasattr(self, "est_tax_spin") else 0.0,
+            )
+
+        def _populate_estimator_tab(self) -> None:
+            if not hasattr(self, "est_materials_table"):
+                return
+            mats = sorted(set(e.material for e in self.entries if e.material))
+            self.est_materials_table.setRowCount(len(mats))
+            scene = getattr(self.viewport, "scene", None) if hasattr(self, "viewport") else None
+
+            self.est_materials_table.blockSignals(True)
+
+            basis_choices = [
+                ("Per Full Sheet", "sheet"),
+                ("Per Volume (m³ / BF)", "volume"),
+                ("Per Area (m² / sq ft)", "area"),
+                ("Per Commercial Board", "board"),
+                ("Per Linear Meter", "linear"),
+            ]
+
+            for row, mat_name in enumerate(mats):
+                st_info = self.material_types.get(mat_name, get_material_stock_label(mat_name, scene=scene))
+                cfg = self.pricing_configs.get(mat_name)
+                if cfg is None:
+                    def_basis, def_price = get_default_pricing(mat_name, st_info)
+                    def_density = get_default_density(mat_name)
+                    cfg = MaterialPricingConfig(
+                        material_name=mat_name,
+                        pricing_basis=def_basis,
+                        unit_price=def_price,
+                        density_kg_m3=def_density,
+                    )
+                    self.pricing_configs[mat_name] = cfg
+
+                # Col 0: Material Name + Thumbnail
+                _, mat_icon = get_material_thumbnail(mat_name, scene=scene, size=18, cache=self._thumbnail_cache)
+                name_item = QTableWidgetItem(f" {mat_name}")
+                if mat_icon is not None and not mat_icon.isNull():
+                    name_item.setIcon(mat_icon)
+                name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.est_materials_table.setItem(row, 0, name_item)
+
+                # Col 1: Stock Type
+                st_item = QTableWidgetItem(st_info)
+                st_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.est_materials_table.setItem(row, 1, st_item)
+
+                # Col 2: Pricing Basis Dropdown
+                b_combo = QComboBox()
+                for label, code in basis_choices:
+                    b_combo.addItem(label, code)
+                cur_idx = 0
+                for idx, (_, code) in enumerate(basis_choices):
+                    if code == cfg.pricing_basis:
+                        cur_idx = idx
+                        break
+                b_combo.setCurrentIndex(cur_idx)
+                b_combo.currentIndexChanged.connect(
+                    lambda _idx, m=mat_name, c=b_combo: self._on_mat_basis_changed(m, c)
+                )
+                self.est_materials_table.setCellWidget(row, 2, b_combo)
+
+                # Col 3: Unit Price SpinBox
+                p_spin = QDoubleSpinBox()
+                p_spin.setRange(0.0, 100000.0)
+                p_spin.setDecimals(2)
+                p_spin.setValue(cfg.unit_price)
+                curr = self.est_currency_combo.currentText() if hasattr(self, "est_currency_combo") else "$"
+                p_spin.setPrefix(f"{curr} ")
+                p_spin.valueChanged.connect(
+                    lambda val, m=mat_name: self._on_mat_price_changed(m, val)
+                )
+                self.est_materials_table.setCellWidget(row, 3, p_spin)
+
+                # Col 4: Density SpinBox
+                d_spin = QDoubleSpinBox()
+                d_spin.setRange(1.0, 25000.0)
+                d_spin.setDecimals(1)
+                d_spin.setValue(cfg.density_kg_m3)
+                d_spin.setSuffix(" kg/m³")
+                d_spin.valueChanged.connect(
+                    lambda val, m=mat_name: self._on_mat_density_changed(m, val)
+                )
+                self.est_materials_table.setCellWidget(row, 4, d_spin)
+
+                # Col 5: Subtotal Cost (Calculated)
+                cost_item = QTableWidgetItem(f"{curr} 0.00")
+                cost_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                font_c = cost_item.font()
+                font_c.setBold(True)
+                cost_item.setFont(font_c)
+                cost_item.setForeground(QColor("#38bdf8"))
+                cost_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.est_materials_table.setItem(row, 5, cost_item)
+
+                # Col 6: Weight (Calculated)
+                wt_item = QTableWidgetItem("0.0 kg")
+                wt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                wt_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.est_materials_table.setItem(row, 6, wt_item)
+
+                self.est_materials_table.setRowHeight(row, 28)
+
+            self.est_materials_table.blockSignals(False)
+
+        def _on_mat_basis_changed(self, mat_name: str, combo: QComboBox) -> None:
+            data = combo.currentData()
+            if mat_name in self.pricing_configs:
+                self.pricing_configs[mat_name].pricing_basis = data
+            self._recalculate_estimate()
+
+        def _on_mat_price_changed(self, mat_name: str, val: float) -> None:
+            if mat_name in self.pricing_configs:
+                self.pricing_configs[mat_name].unit_price = val
+            self._recalculate_estimate()
+
+        def _on_mat_density_changed(self, mat_name: str, val: float) -> None:
+            if mat_name in self.pricing_configs:
+                self.pricing_configs[mat_name].density_kg_m3 = val
+            self._recalculate_estimate()
+
+        def _on_estimator_param_changed(self) -> None:
+            curr = self.est_currency_combo.currentText() if hasattr(self, "est_currency_combo") else "$"
+            if hasattr(self, "est_labor_rate_spin"):
+                self.est_labor_rate_spin.setPrefix(f"{curr} ")
+                self.est_cutting_fee_spin.setPrefix(f"{curr} ")
+                self.est_edge_price_spin.setPrefix(f"{curr} ")
+                self.est_hardware_spin.setPrefix(f"{curr} ")
+                self.est_finishing_spin.setPrefix(f"{curr} ")
+                self.est_shipping_spin.setPrefix(f"{curr} ")
+
+            if hasattr(self, "est_materials_table"):
+                for row in range(self.est_materials_table.rowCount()):
+                    spin = self.est_materials_table.cellWidget(row, 3)
+                    if spin and hasattr(spin, "setPrefix"):
+                        spin.setPrefix(f"{curr} ")
+
+            self._recalculate_estimate()
+
+        def _recalculate_estimate(self) -> None:
+            params = self._get_active_estimator_params()
+            summary = compute_project_estimate(
+                entries=self.entries,
+                material_types=self.material_types,
+                sheets_by_mat=self.sheets_by_mat,
+                lumber_by_mat=self.lumber_by_mat,
+                pricing_configs=self.pricing_configs,
+                params=params,
+            )
+            self.current_estimate_summary = summary
+            curr = summary.currency_symbol
+
+            if hasattr(self, "est_materials_table"):
+                m_lines = {l.material_name: l for l in summary.material_lines}
+                for row in range(self.est_materials_table.rowCount()):
+                    name_item = self.est_materials_table.item(row, 0)
+                    if not name_item:
+                        continue
+                    m_name = name_item.text().strip()
+                    line = m_lines.get(m_name)
+                    if line:
+                        cost_item = self.est_materials_table.item(row, 5)
+                        if cost_item:
+                            cost_item.setText(f"{curr} {line.material_cost:,.2f}")
+                        wt_item = self.est_materials_table.item(row, 6)
+                        if wt_item:
+                            wt_item.setText(line.weight_display)
+
+            if hasattr(self, "card_mat_val"):
+                self.card_mat_val.setText(f"{curr} {summary.materials_cost_subtotal:,.2f}")
+                self.card_lab_val.setText(f"{curr} {summary.labor_cost_subtotal + summary.machining_cutting_subtotal:,.2f}")
+                self.card_extra_val.setText(f"{curr} {summary.hardware_extras_subtotal:,.2f}")
+                self.card_wt_val.setText(summary.total_weight_display)
+                self.card_net_val.setText(f"{curr} {summary.net_cost:,.2f}")
+                self.card_quote_val.setText(f"{curr} {summary.total_project_quote:,.2f}")
+
+        def _save_pricing_defaults(self) -> None:
+            success = save_material_pricing_library(self.pricing_configs)
+            orig = self.save_price_defaults_btn.text()
+            if success:
+                self.save_price_defaults_btn.setText("✓ Prices Saved!")
+            else:
+                self.save_price_defaults_btn.setText("⚠ Save Failed")
+            QTimer.singleShot(2000, lambda: self.save_price_defaults_btn.setText(orig))
+
+        def _copy_estimate_tsv(self) -> None:
+            if not self.current_estimate_summary:
+                self._recalculate_estimate()
+            s = self.current_estimate_summary
+            if not s:
+                return
+            curr = s.currency_symbol
+            lines = [
+                f"Commercial Estimate & Client Quote\t{get_project_name(self.viewport)}",
+                f"Mode:\t{s.estimation_mode}\tWeight:\t{s.total_weight_display}",
+                "",
+                "No.\tMaterial\tStock Type\tQuantity\tBasis\tUnit Rate\tTotal Cost\tWeight",
+            ]
+            for idx, l in enumerate(s.material_lines, start=1):
+                lines.append(f"{idx}\t{l.material_name}\t{l.stock_type}\t{l.raw_units_count} {l.raw_units_label}\t{l.pricing_basis}\t{curr}{l.unit_price:.2f}\t{curr}{l.material_cost:.2f}\t{l.weight_display}")
+            lines.extend([
+                "",
+                f"Materials Subtotal:\t{curr}{s.materials_cost_subtotal:.2f}",
+                f"Labor Cost:\t{curr}{s.labor_cost_subtotal:.2f}",
+                f"Machining / Cutting:\t{curr}{s.machining_cutting_subtotal:.2f}",
+                f"Hardware & Extras:\t{curr}{s.hardware_extras_subtotal:.2f}",
+                f"Net Production Cost:\t{curr}{s.net_cost:.2f}",
+                f"Overhead & Margin:\t{curr}{s.overhead_margin_amount:.2f}",
+                f"Sales Tax / VAT:\t{curr}{s.tax_amount:.2f}",
+                f"FINAL QUOTE PRICE:\t{curr}{s.total_project_quote:.2f}",
+                f"TOTAL WEIGHT:\t{s.total_weight_display}",
+            ])
+            QApplication.clipboard().setText("\n".join(lines))
+            orig = self.copy_quote_btn.text()
+            self.copy_quote_btn.setText("✓ Copied!")
+            QTimer.singleShot(1500, lambda: self.copy_quote_btn.setText(orig))
+
+        def _export_estimate_csv(self) -> None:
+            if not self.current_estimate_summary:
+                self._recalculate_estimate()
+            s = self.current_estimate_summary
+            if not s:
+                return
+            path, _ = QFileDialog.getSaveFileName(self, "Export Estimate CSV", "estimate_quote.csv", "CSV Files (*.csv)")
+            if not path:
+                return
+            try:
+                curr = s.currency_symbol
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(["Project Estimate & Commercial Quote", get_project_name(self.viewport)])
+                    w.writerow(["Mode", s.estimation_mode, "Total Weight", s.total_weight_display])
+                    w.writerow([])
+                    w.writerow(["#", "Material", "Stock Type", "Quantity", "Pricing Basis", f"Unit Rate ({curr})", f"Total Cost ({curr})", "Weight"])
+                    for idx, l in enumerate(s.material_lines, start=1):
+                        w.writerow([idx, l.material_name, l.stock_type, f"{l.raw_units_count} {l.raw_units_label}", l.pricing_basis, f"{l.unit_price:.2f}", f"{l.material_cost:.2f}", l.weight_display])
+                    w.writerow([])
+                    w.writerow(["Summary Component", f"Amount ({curr})"])
+                    w.writerow(["Materials Subtotal", f"{s.materials_cost_subtotal:.2f}"])
+                    w.writerow(["Labor Cost", f"{s.labor_cost_subtotal:.2f}"])
+                    w.writerow(["Machining & Operations", f"{s.machining_cutting_subtotal:.2f}"])
+                    w.writerow(["Hardware & Extras", f"{s.hardware_extras_subtotal:.2f}"])
+                    w.writerow(["Net Production Cost", f"{s.net_cost:.2f}"])
+                    w.writerow(["Overhead & Margin", f"{s.overhead_margin_amount:.2f}"])
+                    w.writerow(["Sales Tax / VAT", f"{s.tax_amount:.2f}"])
+                    w.writerow(["FINAL CLIENT QUOTE", f"{s.total_project_quote:.2f}"])
+                    w.writerow(["TOTAL WEIGHT", s.total_weight_display])
+                QMessageBox.information(self, "Complete", f"Estimate CSV exported successfully to:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export CSV:\n{e}")
+
+        def _export_estimate_pdf(self) -> None:
+            if not self.current_estimate_summary:
+                self._recalculate_estimate()
+            s = self.current_estimate_summary
+            if not s:
+                return
+            doc_name = get_project_name(self.viewport)
+            base_name = Path(doc_name).stem if doc_name else "project"
+            default_path = f"{base_name}_estimate_quote.pdf"
+            path, _ = QFileDialog.getSaveFileName(self, "Export Estimate PDF", default_path, "PDF Documents (*.pdf)")
+            if not path:
+                return
+            try:
+                render_estimate_pdf(path, s, project_name=doc_name, viewport=self.viewport)
+                orig = self.print_estimate_pdf_btn.text()
+                self.print_estimate_pdf_btn.setText("✓ PDF Saved!")
+                QTimer.singleShot(2500, lambda: self.print_estimate_pdf_btn.setText(orig))
+                try:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                except Exception:
+                    pass
+                QMessageBox.information(self, "Complete", f"Estimate PDF saved to:\n{path}\n\nOpening in your default viewer...")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export PDF:\n{e}")
 
