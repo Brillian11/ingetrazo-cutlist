@@ -6210,21 +6210,20 @@ if QT_AVAILABLE:
 
         def _export_to_composer(self) -> None:
             """Exports high-resolution exploded technical drawing directly into IngeTrazo Sheet Composer."""
-            doc_name = get_project_name(self.viewport)
-            clean_name = re.sub(r'[^\w\-_\.]', '_', doc_name) if doc_name else "exploded_assembly"
-            default_filename = f"{clean_name}_exploded_drawing.png"
-
-            path, _ = QFileDialog.getSaveFileName(
-                self,
-                "Export Exploded Drawing to IngeTrazo Composer",
-                default_filename,
-                "PNG Images (*.png)"
-            )
-            if not path:
-                return
-
             try:
-                # 1. Render high-res drawing with title, exploded 3D model, callout balloons, and parts legend
+                # 1. Determine output file path in persistent drawings cache
+                appdata = os.environ.get("APPDATA")
+                if appdata:
+                    drawings_dir = Path(appdata) / "IngeTrazo" / "drawings"
+                else:
+                    drawings_dir = Path.home() / ".ingetrazo" / "drawings"
+                drawings_dir.mkdir(parents=True, exist_ok=True)
+
+                doc_name = get_project_name(self.viewport)
+                clean_name = re.sub(r'[^\w\-_\.]', '_', doc_name) if doc_name else "exploded_assembly"
+                path = str(drawings_dir / f"{clean_name}_exploded_drawing.png")
+
+                # 2. Render high-res drawing with title, exploded 3D model, callout balloons, and parts legend
                 w, h = 2400, 1600
                 pix = QPixmap(w, h)
                 pix.fill(Qt.transparent)
@@ -6233,12 +6232,12 @@ if QT_AVAILABLE:
                 p.end()
                 pix.save(path, "PNG")
 
-                # 2. Locate IngeTrazo MainWindow
+                # 3. Locate IngeTrazo MainWindow
                 main_win = None
                 if hasattr(self, "viewport") and self.viewport is not None:
                     if hasattr(self.viewport, "window"):
                         main_win = self.viewport.window()
-                    elif hasattr(self.viewport, "parent") and self.viewport.parent():
+                    if not main_win and hasattr(self.viewport, "parent") and self.viewport.parent():
                         p_widget = self.viewport.parent()
                         if hasattr(p_widget, "window"):
                             main_win = p_widget.window()
@@ -6251,71 +6250,136 @@ if QT_AVAILABLE:
 
                 composer = None
                 if main_win is not None:
-                    # Open or raise Sheet Composer
-                    if hasattr(main_win, "_on_open_composer"):
-                        main_win._on_open_composer()
-                    elif hasattr(main_win, "_ensure_composer"):
-                        main_win._ensure_composer()
-
-                    composer = getattr(main_win, "_composer", None)
-                    if not composer and hasattr(main_win, "_ensure_composer"):
+                    if hasattr(main_win, "_ensure_composer"):
                         composer = main_win._ensure_composer()
+                    elif hasattr(main_win, "_composer"):
+                        composer = main_win._composer
+                    elif hasattr(main_win, "_on_open_composer"):
+                        main_win._on_open_composer()
+                        composer = getattr(main_win, "_composer", None)
 
-                # 3. Insert drawing onto Composer Sheet
+                # 4. Insert drawing onto Composer Sheet
                 inserted = False
                 if composer is not None:
                     try:
-                        # Ensure a sheet exists
-                        if not getattr(composer, "comp", None) and hasattr(composer, "_new_sheet_tab"):
-                            composer._new_sheet_tab()
+                        # Ensure a sheet exists in scene compositions
+                        scene = getattr(composer, "_scene", None) or getattr(self.viewport, "scene", None)
+                        comps = getattr(scene, "compositions", []) if scene else []
+                        if not getattr(composer, "comp", None) or len(comps) == 0:
+                            if hasattr(composer, "_on_comp_add"):
+                                composer._on_comp_add()
 
-                        # Try to import AddItemCommand and ImagenItem from views.composer
-                        from views.composer import AddItemCommand, ImagenItem
-                        comp = getattr(composer, "comp", None)
-                        margin = getattr(comp, "margin_mm", [15.0, 15.0, 15.0, 15.0]) if comp else [15.0, 15.0, 15.0, 15.0]
-                        x_mm = float(margin[0] if isinstance(margin, (list, tuple)) else 15.0)
-                        y_mm = float(margin[1] if isinstance(margin, (list, tuple)) else 15.0)
-                        z = composer._next_z() if hasattr(composer, "_next_z") else 1
-                        # Drawing item size (landscape A4 printable area ~260 x 173 mm)
-                        w_mm = 260.0
-                        h_mm = 173.3
-                        item = ImagenItem(x_mm, y_mm, w_mm, h_mm, path, z)
-                        if hasattr(composer, "history") and hasattr(composer.history, "execute"):
-                            composer.history.execute(AddItemCommand(composer.comp, item))
-                            inserted = True
-                        elif hasattr(comp, "items"):
-                            comp.items.append(item)
-                            inserted = True
+                        # Determine sheet usable dimension in mm
+                        pw, ph = (297.0, 210.0)
+                        if hasattr(composer, "comp") and composer.comp:
+                            if hasattr(composer.comp, "page_size_mm"):
+                                pw, ph = composer.comp.page_size_mm()
+                            m_raw = getattr(composer.comp, "margin_mm", 10.0)
+                            m = float(m_raw) if isinstance(m_raw, (int, float)) else 10.0
+                        else:
+                            m = 10.0
 
+                        avail_w = max(50.0, pw - 2.0 * m)
+                        avail_h = max(50.0, ph - 2.0 * m)
+                        # Aspect ratio 2400 / 1600 = 1.5
+                        target_w = avail_w
+                        target_h = target_w / 1.5
+                        if target_h > avail_h:
+                            target_h = avail_h
+                            target_w = target_h * 1.5
+
+                        x_mm = m + (avail_w - target_w) / 2.0
+                        y_mm = m + (avail_h - target_h) / 2.0
+                        z_val = composer._next_z() if hasattr(composer, "_next_z") else 1
+
+                        # Import core.composition and create ImagenItem
+                        try:
+                            from core.composition import ImagenItem, AddItemCommand
+                            item = ImagenItem(
+                                x_mm=float(x_mm),
+                                y_mm=float(y_mm),
+                                w_mm=float(target_w),
+                                h_mm=float(target_h),
+                                path=path,
+                                z=z_val
+                            )
+                            if hasattr(composer, "history") and hasattr(composer.history, "execute"):
+                                composer.history.execute(AddItemCommand(composer.comp, item))
+                                inserted = True
+                            elif hasattr(composer.comp, "images"):
+                                composer.comp.images.append(item)
+                                inserted = True
+                        except Exception as import_err:
+                            sys.stderr.write(f"[CutList] core.composition import note: {import_err}\n")
+                            import sys
+                            ccomp = sys.modules.get("core.composition")
+                            if ccomp and hasattr(ccomp, "ImagenItem"):
+                                item = ccomp.ImagenItem(
+                                    x_mm=float(x_mm),
+                                    y_mm=float(y_mm),
+                                    w_mm=float(target_w),
+                                    h_mm=float(target_h),
+                                    path=path,
+                                    z=z_val
+                                )
+                                if hasattr(composer.comp, "images"):
+                                    composer.comp.images.append(item)
+                                    inserted = True
+
+                        if hasattr(composer, "_rebuild_canvas"):
+                            composer._rebuild_canvas()
                         if hasattr(composer, "zoom_fit_page"):
                             composer.zoom_fit_page()
+
+                    except Exception as err:
+                        sys.stderr.write(f"[CutList] Error adding item to composer: {err}\n")
+
+                # 5. Bring composer forward and handle user transition
+                if composer is not None:
+                    try:
+                        from views.composer import bring_to_front
+                        bring_to_front(composer)
+                    except Exception:
+                        if hasattr(composer, "show"):
+                            composer.show()
                         if hasattr(composer, "raise_"):
                             composer.raise_()
-                    except Exception as err:
-                        sys.stderr.write(f"[CutList] Note on inserting into composer: {err}\\n")
+                        if hasattr(composer, "activateWindow"):
+                            composer.activateWindow()
 
-                if inserted:
-                    QMessageBox.information(
+                    # Ask whether to switch to Composer or stay in Cut List
+                    reply = QMessageBox.question(
                         self,
-                        "IngeTrazo Composer",
-                        f"Exploded assembly drawing exported and placed onto the active sheet in IngeTrazo Composer!\\n\\nImage saved to:\\n{path}"
+                        "IngeTrazo Sheet Composer",
+                        "Exploded assembly drawing has been placed onto the Sheet Composer!\n\n"
+                        "Switch to IngeTrazo Composer now?\n\n"
+                        "(Click 'Yes' to open Composer and start composing your sheet, or 'No' to stay in Cut List).",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
                     )
-                elif composer is not None:
-                    if hasattr(composer, "raise_"):
-                        composer.raise_()
-                    QMessageBox.information(
-                        self,
-                        "IngeTrazo Composer",
-                        f"Exploded drawing saved to:\\n{path}\\n\\nIngeTrazo Composer is open. You can place or reposition this drawing using: Insert ▸ Image."
-                    )
+                    if reply == QMessageBox.Yes:
+                        self.accept()
+                    else:
+                        orig = self.export_composer_btn.text()
+                        self.export_composer_btn.setText("✓ Placed in Composer!")
+                        QTimer.singleShot(3000, lambda: self.export_composer_btn.setText(orig))
                 else:
-                    QMessageBox.information(
+                    # Fallback when running outside IngeTrazo main window: prompt save dialog
+                    save_path, _ = QFileDialog.getSaveFileName(
                         self,
-                        "Export Complete",
-                        f"Exploded drawing saved to:\\n{path}\\n\\nYou can now place this drawing in IngeTrazo Sheet Composer."
+                        "Save Exploded Drawing Image",
+                        f"{clean_name}_exploded_drawing.png",
+                        "PNG Images (*.png)"
                     )
+                    if save_path:
+                        pix.save(save_path, "PNG")
+                        QMessageBox.information(
+                            self,
+                            "Export Complete",
+                            f"Exploded drawing saved to:\n{save_path}\n\nYou can insert this drawing into IngeTrazo Composer via Insert ▸ Image."
+                        )
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to export drawing to IngeTrazo Composer:\\n{e}")
+                QMessageBox.critical(self, "Error", f"Failed to export drawing to IngeTrazo Composer:\n{e}")
 
         # -------------------------------------------------------------------
         # Cost & Weight Estimator Methods
