@@ -4611,11 +4611,18 @@ if QT_AVAILABLE:
             bot_layout.addWidget(close_btn)
             layout.addLayout(bot_layout)
 
+    _active_cutlist_window: Optional[Any] = None
+
     class CutListWindow(QDialog):
         """The main Cut List Window with List, Diagrams, and Exploded Drawing."""
 
         def __init__(self, viewport: Any, parent: Optional[QWidget] = None) -> None:
             super().__init__(parent or getattr(viewport, "window", lambda: None)())
+            self.setModal(False)
+            if QT_AVAILABLE:
+                self.setWindowFlags(
+                    (self.windowFlags() & ~Qt.WindowContextHelpButtonHint) | Qt.Window
+                )
             self.viewport = viewport
             self.raw_parts: List[RawPart] = []
             self.entries: List[CutListEntry] = []
@@ -4789,18 +4796,19 @@ if QT_AVAILABLE:
 
             main_layout.addWidget(settings_group)
 
-            # Central GENERATE Button
+            # Central GENERATE Button (Green Button)
             self.generate_btn = QPushButton("🚀 Generate Cut List & Drawings")
             font_g = self.generate_btn.font()
             font_g.setPointSize(11)
             font_g.setBold(True)
             self.generate_btn.setFont(font_g)
-            self.generate_btn.setMinimumHeight(40)
+            self.generate_btn.setMinimumHeight(42)
             self.generate_btn.setStyleSheet(
-                "QPushButton { background-color: #2b9348; color: white; border-radius: 5px; } "
+                "QPushButton { background-color: #2b9348; color: white; border-radius: 5px; font-weight: bold; } "
                 "QPushButton:hover { background-color: #55a630; } "
                 "QPushButton:pressed { background-color: #1b4332; }"
             )
+            self.generate_btn.setToolTip("Read current workspace objects and generate/synchronize cut list, nesting diagrams, and 3D drawings.")
             self.generate_btn.clicked.connect(self.generate_all)
             main_layout.addWidget(self.generate_btn)
 
@@ -5228,6 +5236,9 @@ if QT_AVAILABLE:
                 self._recalculate_estimate()
 
         def closeEvent(self, event: Any) -> None:
+            global _active_cutlist_window
+            if _active_cutlist_window is self:
+                _active_cutlist_window = None
             vp = self.viewport
             scene = getattr(vp, "scene", None)
             if scene is not None:
@@ -5237,6 +5248,9 @@ if QT_AVAILABLE:
             super().closeEvent(event)
 
         def accept(self) -> None:
+            global _active_cutlist_window
+            if _active_cutlist_window is self:
+                _active_cutlist_window = None
             vp = self.viewport
             scene = getattr(vp, "scene", None)
             if scene is not None:
@@ -5246,6 +5260,9 @@ if QT_AVAILABLE:
             super().accept()
 
         def reject(self) -> None:
+            global _active_cutlist_window
+            if _active_cutlist_window is self:
+                _active_cutlist_window = None
             vp = self.viewport
             scene = getattr(vp, "scene", None)
             if scene is not None:
@@ -5257,23 +5274,25 @@ if QT_AVAILABLE:
         # -------------------------------------------------------------------
         # Selection & Materials
         # -------------------------------------------------------------------
-        def _load_selection(self) -> None:
+        def _load_selection(self) -> bool:
             scene = getattr(self.viewport, "scene", None)
             selected_groups = get_selected_groups(scene)
 
             if not selected_groups:
-                self.selection_label.setText("⚠ No objects currently selected in viewport.")
+                self.selection_label.setText("⚠ No objects currently selected in viewport. Select parts and click 'Generate'.")
                 self.selection_label.setStyleSheet("color: #e63946;")
                 self.raw_parts = []
                 self.mat_table.setRowCount(0)
+                return False
             else:
                 self.raw_parts = extract_parts_from_groups(selected_groups)
                 count = len(self.raw_parts)
-                self.selection_label.setText(f"✓ {count} parts selected and ready for cut list.")
+                self.selection_label.setText(f"✓ {count} parts ready in workspace. Click green button to generate.")
                 self.selection_label.setStyleSheet("color: #2b9348;")
                 self._populate_material_table()
                 if self.tabs.currentIndex() == 2 and hasattr(self, "drawing_widget"):
                     self.drawing_widget.update_3d_render(full_res=True, refresh_cad=True)
+                return True
 
         def _populate_material_table(self) -> None:
             mats: Dict[str, Tuple[float, float]] = {}
@@ -5392,15 +5411,14 @@ if QT_AVAILABLE:
         # Core Generation (List, Diagrams, and Exploded Drawing)
         # -------------------------------------------------------------------
         def generate_all(self) -> None:
+            self._load_selection()
             if not self.raw_parts:
-                self._load_selection()
-                if not self.raw_parts:
-                    QMessageBox.warning(
-                        self,
-                        "No Selection",
-                        "Please select the objects (groups or components) you want to cut in the 3D viewport first."
-                    )
-                    return
+                QMessageBox.warning(
+                    self,
+                    "No Selection",
+                    "Please select the objects (groups or components) you want to cut in the 3D viewport first, then click 'Generate'."
+                )
+                return
 
             u = self.unit_combo.currentText()
             factor = UNIT_FACTORS.get(u, 1000.0)
@@ -5478,6 +5496,12 @@ if QT_AVAILABLE:
             if hasattr(self, "_populate_estimator_tab"):
                 self._populate_estimator_tab()
                 self._recalculate_estimate()
+
+            # 8. Status update
+            count = len(self.raw_parts)
+            self.selection_label.setText(f"✓ Cut list synchronized with workspace ({count} parts). Workspace remains editable.")
+            self.selection_label.setStyleSheet("color: #2b9348; font-weight: bold;")
+            self.summary_label.setText(f"Generated {len(self.entries)} cut list items ({count} parts total) across {len(by_mat)} materials.")
 
         def _on_thick_sort_changed(self) -> None:
             mode = getattr(self, "table_view_mode", "both")
@@ -6795,8 +6819,22 @@ if QT_AVAILABLE:
 # Core Entry Point
 # ---------------------------------------------------------------------------
 def run_cutlist(viewport: Any) -> None:
+    global _active_cutlist_window
     if viewport is None:
         return
+
+    parent_win = getattr(viewport, "window", lambda: None)()
+
+    # If already open, bring to front without re-running or disturbing user
+    if _active_cutlist_window is not None:
+        try:
+            if _active_cutlist_window.isVisible():
+                _active_cutlist_window.showNormal()
+                _active_cutlist_window.raise_()
+                _active_cutlist_window.activateWindow()
+                return
+        except Exception:
+            _active_cutlist_window = None
 
     scene = getattr(viewport, "scene", None)
     selected_groups = get_selected_groups(scene)
@@ -6816,7 +6854,11 @@ def run_cutlist(viewport: Any) -> None:
 
     if QT_AVAILABLE:
         win = CutListWindow(viewport, parent=parent_win)
-        win.exec()
+        _active_cutlist_window = win
+        win.setModal(False)
+        win.show()
+        win.raise_()
+        win.activateWindow()
 
 
 def show_about_dialog(parent: Optional[Any] = None) -> None:

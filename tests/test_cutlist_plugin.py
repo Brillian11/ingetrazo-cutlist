@@ -798,6 +798,25 @@ class TestCutListPlugin(unittest.TestCase):
         self.assertIn("table_w = min(inner_rect.width() * 0.55, 480.0 * ui_scale)", src)
         self.assertIn("is_export=True", src)
 
+    def test_non_modal_workspace_editable_and_frozen_cutlist(self):
+        """Verify CutListWindow is non-modal so workspace can be edited, with cutlist frozen until green button click."""
+        plugin_path = Path(__file__).parent.parent / "cutlist_plugin.py"
+        with open(plugin_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # 1. Modeless window setup
+        self.assertIn("self.setModal(False)", src)
+        self.assertIn("win.show()", src)
+        self.assertNotIn("win.exec()", src)
+        self.assertIn("_active_cutlist_window", src)
+
+        # 2. Green button styling & unfreeze connection
+        self.assertIn("background-color: #2b9348", src)
+        self.assertIn("self.generate_btn.clicked.connect(self.generate_all)", src)
+
+        # 3. generate_all re-reads selection from workspace on click
+        self.assertIn("def generate_all(self) -> None:\n            self._load_selection()", src)
+
 
 if __name__ == "__main__":
     unittest.main()
