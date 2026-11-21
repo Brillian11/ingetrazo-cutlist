@@ -537,6 +537,63 @@ class TestCutListPlugin(unittest.TestCase):
             self.assertTrue(os.path.exists(pdf_path))
             self.assertGreater(os.path.getsize(pdf_path), 50)
 
+    def test_rough_cut_allowances_and_dimensions(self):
+        """Verify rough cut allowances (+2mm thickness, +20mm length, +6mm width) for solid wood."""
+        solid_entry = cp.CutListEntry("A", "Solid Rail", 2, 1.8662, 0.100, 0.018, "Pine woods")
+        sheet_entry = cp.CutListEntry("B", "Plywood Back", 1, 2.1798, 0.648, 0.003, "Poplar")
+        entries = [solid_entry, sheet_entry]
+
+        mat_types = {
+            "Pine woods": "🌲 Solid Wood (Lumber)",
+            "Poplar": "🔲 Wood (Sheet / Plywood)",
+        }
+
+        cp.update_entries_rough_dimensions(
+            entries,
+            mat_types,
+            over_length=0.020,
+            over_width=0.006,
+            over_thickness=0.002,
+            apply_to_solid_only=True,
+        )
+
+        # Solid wood receives allowances: 18mm -> 20mm, 100mm -> 106mm, 1866.2mm -> 1886.2mm
+        self.assertAlmostEqual(solid_entry.rough_thickness, 0.020, places=4)
+        self.assertAlmostEqual(solid_entry.rough_width, 0.106, places=4)
+        self.assertAlmostEqual(solid_entry.rough_length, 1.8862, places=4)
+        self.assertAlmostEqual(solid_entry.r_thickness, 0.020, places=4)
+        self.assertAlmostEqual(solid_entry.thickness, 0.018, places=4)
+        self.assertGreater(solid_entry.rough_total_volume, solid_entry.total_volume)
+
+        # Sheet goods stay at net design dimensions (0 allowance)
+        self.assertAlmostEqual(sheet_entry.rough_thickness, 0.003, places=4)
+        self.assertAlmostEqual(sheet_entry.rough_width, 0.648, places=4)
+        self.assertAlmostEqual(sheet_entry.rough_length, 2.1798, places=4)
+
+    def test_format_volume_and_board_feet(self):
+        """Verify volume formatting in m³, dm³, and Board Feet (BF)."""
+        # dm³ for small volume (< 0.01 m³)
+        self.assertEqual(cp.format_volume(0.005, "mm"), "5.00 dm³")
+        # m³ for larger volume (>= 0.01 m³)
+        self.assertEqual(cp.format_volume(0.125, "mm"), "0.125 m³")
+        # Imperial Board Feet (BF): 1 BF = 12" x 12" x 1" = 0.00235974 m³
+        bf_vol = 0.00235974
+        self.assertEqual(cp.format_volume(bf_vol, "in"), "1.00 BF")
+        self.assertEqual(cp.format_volume(bf_vol * 10, "ft"), "10.00 BF")
+
+    def test_format_console_table_rough_and_finished(self):
+        """Verify console table outputs dual Finished and Rough Cut columns when allowances exist."""
+        entry = cp.CutListEntry("A", "Table Leg", 4, 0.750, 0.080, 0.018, "Oak")
+        entry.rough_length = 0.770
+        entry.rough_width = 0.086
+        entry.rough_thickness = 0.020
+
+        txt = cp.format_console_table([entry], unit="mm")
+        self.assertIn("Finished (L×W×T)", txt)
+        self.assertIn("Rough Cut (L×W×T)", txt)
+        self.assertIn("Rough Vol:", txt)
+        self.assertIn("Oak", txt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -619,12 +619,27 @@ class CutListEntry:
     tag: str
     display_name: str
     count: int
-    length: float       # metres
-    width: float        # metres
-    thickness: float    # metres
+    length: float       # metres (Finished length)
+    width: float        # metres (Finished width)
+    thickness: float    # metres (Finished thickness)
     material: str
     names: List[str] = field(default_factory=list)
     contour_2d: Optional[List[Tuple[float, float]]] = None
+    rough_length: float = 0.0     # metres (Rough pre-milling length)
+    rough_width: float = 0.0      # metres (Rough pre-milling width)
+    rough_thickness: float = 0.0  # metres (Rough pre-milling thickness)
+
+    @property
+    def r_length(self) -> float:
+        return self.rough_length if self.rough_length > 0 else self.length
+
+    @property
+    def r_width(self) -> float:
+        return self.rough_width if self.rough_width > 0 else self.width
+
+    @property
+    def r_thickness(self) -> float:
+        return self.rough_thickness if self.rough_thickness > 0 else self.thickness
 
     @property
     def unit_area(self) -> float:
@@ -641,6 +656,54 @@ class CutListEntry:
     @property
     def total_volume(self) -> float:
         return self.unit_volume * self.count
+
+    @property
+    def rough_unit_area(self) -> float:
+        return self.r_length * self.r_width
+
+    @property
+    def rough_total_area(self) -> float:
+        return self.rough_unit_area * self.count
+
+    @property
+    def rough_unit_volume(self) -> float:
+        return self.r_length * self.r_width * self.r_thickness
+
+    @property
+    def rough_total_volume(self) -> float:
+        return self.rough_unit_volume * self.count
+
+
+@dataclass
+class RoughAllowances:
+    over_length: float = 0.020      # default +20 mm
+    over_width: float = 0.006       # default +6 mm
+    over_thickness: float = 0.002   # default +2 mm (e.g. 18 mm finished from 20 mm rough)
+    apply_to_solid_only: bool = True
+
+
+def update_entries_rough_dimensions(
+    entries: List[CutListEntry],
+    material_types: Dict[str, str],
+    over_length: float = 0.020,
+    over_width: float = 0.006,
+    over_thickness: float = 0.002,
+    apply_to_solid_only: bool = True,
+) -> None:
+    """Computes rough_length, rough_width, rough_thickness for each CutListEntry
+    based on material stock type and rough allowances.
+    """
+    for e in entries:
+        st = material_types.get(e.material, "")
+        is_solid = is_linear_stock(st) or "Solid" in st or "Lumber" in st
+        if apply_to_solid_only and not is_solid:
+            e.rough_length = e.length
+            e.rough_width = e.width
+            e.rough_thickness = e.thickness
+        else:
+            e.rough_length = e.length + over_length
+            e.rough_width = e.width + over_width
+            e.rough_thickness = e.thickness + over_thickness
 
 
 # --- Sheet Goods Models ---
@@ -1589,13 +1652,27 @@ def format_console_table(entries: List[CutListEntry], unit: str = "mm") -> str:
     total_parts = sum(e.count for e in entries)
     unique_parts = len(entries)
     total_area = sum(e.total_area for e in entries)
+    has_rough = any(e.r_length != e.length or e.r_thickness != e.thickness for e in entries)
+
+    if has_rough:
+        w_total = 118
+        header_line = (
+            f"{'Tag':>4} | {'#':>3} | {'Part Name / Description':<24} | {'Qty':>4} | "
+            f"{f'Finished (L×W×T)':^21} | {f'Rough Cut (L×W×T)':^21} | {'Material':<12}"
+        )
+    else:
+        w_total = 96
+        header_line = (
+            f"{'Tag':>4} | {'#':>3} | {'Part Name / Description':<26} | {'Qty':>4} | "
+            f"{f'Length ({unit})':>11} | {f'Width ({unit})':>11} | {f'Thick ({unit})':>11} | {'Material':<12}"
+        )
 
     lines = [
-        "=" * 96,
-        f"{'INGETRAZO — OPEN CUT LIST':^96}",
-        "=" * 96,
-        f"{'Tag':>4} | {'#':>3} | {'Part Name / Description':<26} | {'Qty':>4} | {f'Length ({unit})':>11} | {f'Width ({unit})':>11} | {f'Thick ({unit})':>11} | {'Material':<12}",
-        "-" * 96,
+        "=" * w_total,
+        f"{'INGETRAZO — OPEN CUT LIST':^{w_total}}",
+        "=" * w_total,
+        header_line,
+        "-" * w_total,
     ]
 
     curr_mat = None
@@ -1603,25 +1680,42 @@ def format_console_table(entries: List[CutListEntry], unit: str = "mm") -> str:
         if e.material != curr_mat:
             curr_mat = e.material
             mat_header = f"--- [ Material: {curr_mat} ] "
-            lines.append(mat_header + "-" * max(4, 96 - len(mat_header)))
+            lines.append(mat_header + "-" * max(4, w_total - len(mat_header)))
 
-        name_t = e.display_name if len(e.display_name) <= 26 else (e.display_name[:23] + "...")
-        mat_t = e.material if len(e.material) <= 12 else (e.material[:9] + "...")
-        row = (
-            f"({e.tag}) | "
-            f"{i:>3} | "
-            f"{name_t:<26} | "
-            f"{e.count:>4} | "
-            f"{format_dimension(e.length, unit):>11} | "
-            f"{format_dimension(e.width, unit):>11} | "
-            f"{format_dimension(e.thickness, unit):>11} | "
-            f"{mat_t:<12}"
-        )
+        if has_rough:
+            name_t = e.display_name if len(e.display_name) <= 24 else (e.display_name[:21] + "...")
+            mat_t = e.material if len(e.material) <= 12 else (e.material[:9] + "...")
+            fin_str = f"{format_dimension(e.length, unit)}×{format_dimension(e.width, unit)}×{format_dimension(e.thickness, unit)}"
+            rgh_str = f"{format_dimension(e.r_length, unit)}×{format_dimension(e.r_width, unit)}×{format_dimension(e.r_thickness, unit)}"
+            row = (
+                f"({e.tag}) | "
+                f"{i:>3} | "
+                f"{name_t:<24} | "
+                f"{e.count:>4} | "
+                f"{fin_str:>21} | "
+                f"{rgh_str:>21} | "
+                f"{mat_t:<12}"
+            )
+        else:
+            name_t = e.display_name if len(e.display_name) <= 26 else (e.display_name[:23] + "...")
+            mat_t = e.material if len(e.material) <= 12 else (e.material[:9] + "...")
+            row = (
+                f"({e.tag}) | "
+                f"{i:>3} | "
+                f"{name_t:<26} | "
+                f"{e.count:>4} | "
+                f"{format_dimension(e.length, unit):>11} | "
+                f"{format_dimension(e.width, unit):>11} | "
+                f"{format_dimension(e.thickness, unit):>11} | "
+                f"{mat_t:<12}"
+            )
         lines.append(row)
 
-    lines.append("-" * 96)
-    lines.append(f"Total Parts: {total_parts}  |  Unique Sizes: {unique_parts}  |  Total Surface Area: {format_area(total_area, unit)}")
-    lines.append("=" * 96)
+    lines.append("-" * w_total)
+    tot_vol = sum(e.rough_total_volume for e in entries)
+    vol_str = f"  |  Rough Vol: {format_volume(tot_vol, unit)}" if has_rough else ""
+    lines.append(f"Total Parts: {total_parts}  |  Unique Sizes: {unique_parts}  |  Total Surface Area: {format_area(total_area, unit)}{vol_str}")
+    lines.append("=" * w_total)
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -1659,6 +1753,16 @@ def get_project_name(viewport: Any = None) -> str:
     return "table saw Circular.skp"
 
 
+def format_volume(vol_m3: float, unit: str = "mm") -> str:
+    """Formats volume for PDF reports and summaries (cubic metres / dm³ or Board Feet)."""
+    if unit in ("in", "ft"):
+        bf = vol_m3 / 0.00235974
+        return f"{bf:.2f} BF"
+    if vol_m3 < 0.01:
+        return f"{vol_m3 * 1000.0:.2f} dm³"
+    return f"{vol_m3:.3f} m³"
+
+
 def render_cutlist_pdf(
     path: str,
     entries: List[CutListEntry],
@@ -1667,7 +1771,7 @@ def render_cutlist_pdf(
     material_types: Optional[Dict[str, str]] = None,
 ) -> None:
     """Renders the OpenCutList-styled Parts List PDF report matching the standard
-    OpenCutList workshop documentation format.
+    OpenCutList workshop documentation format, featuring both Rough Cut and Finished Cut tables.
     """
     if not QT_AVAILABLE:
         # Graceful headless fallback for testing environments
@@ -1707,22 +1811,49 @@ def render_cutlist_pdf(
     h_row = 20.0 * scale
     h_gap = 14.0 * scale
 
-    # Column Widths
     W = content_w
-    w_col0 = round(W * 0.07)   # Type / No.
-    w_col1 = round(W * 0.49)   # Material / Designation
-    w_col2 = round(W * 0.12)   # Quantity / Qty.
-    w_col3 = round(W * 0.106)  # Length / L
-    w_col4 = round(W * 0.106)  # Area / W
-    w_col5 = round(W - (w_col0 + w_col1 + w_col2 + w_col3 + w_col4))  # Volume / T
-    w_sub_total = w_col3 + w_col4 + w_col5
+    # Summary Table Column Widths
+    w_s_col0 = round(W * 0.07)   # Type
+    w_s_col1 = round(W * 0.49)   # Material / Thickness
+    w_s_col2 = round(W * 0.12)   # Quantity
+    w_s_col3 = round(W * 0.106)  # Length
+    w_s_col4 = round(W * 0.106)  # Area
+    w_s_col5 = round(W - (w_s_col0 + w_s_col1 + w_s_col2 + w_s_col3 + w_s_col4))  # Volume
+    w_s_sub_total = w_s_col3 + w_s_col4 + w_s_col5
 
-    x_col0 = margin_x
-    x_col1 = x_col0 + w_col0
-    x_col2 = x_col1 + w_col1
-    x_col3 = x_col2 + w_col2
-    x_col4 = x_col3 + w_col3
-    x_col5 = x_col4 + w_col4
+    x_s_col0 = margin_x
+    x_s_col1 = x_s_col0 + w_s_col0
+    x_s_col2 = x_s_col1 + w_s_col1
+    x_s_col3 = x_s_col2 + w_s_col2
+    x_s_col4 = x_s_col3 + w_s_col3
+    x_s_col5 = x_s_col4 + w_s_col4
+
+    # Material Breakdown Table Column Widths (Dual Rough & Finished)
+    w_m_col0 = round(W * 0.06)   # No. (Tag)
+    w_m_col1 = round(W * 0.34)   # Designation
+    w_m_col2 = round(W * 0.08)   # Qty.
+    w_m_rough = round(W * 0.26)  # Rough Super-Header
+    w_m_fin = round(W - (w_m_col0 + w_m_col1 + w_m_col2 + w_m_rough))  # Finished Super-Header
+
+    w_r_l = round(w_m_rough * 0.33)
+    w_r_w = round(w_m_rough * 0.33)
+    w_r_t = w_m_rough - w_r_l - w_r_w
+
+    w_f_l = round(w_m_fin * 0.33)
+    w_f_w = round(w_m_fin * 0.33)
+    w_f_t = w_m_fin - w_f_l - w_f_w
+
+    x_m_col0 = margin_x
+    x_m_col1 = x_m_col0 + w_m_col0
+    x_m_col2 = x_m_col1 + w_m_col1
+    x_m_rough = x_m_col2 + w_m_col2
+    x_m_r_l = x_m_rough
+    x_m_r_w = x_m_r_l + w_r_l
+    x_m_r_t = x_m_r_w + w_r_w
+    x_m_fin = x_m_rough + w_m_rough
+    x_m_f_l = x_m_fin
+    x_m_f_w = x_m_f_l + w_f_l
+    x_m_f_t = x_m_f_w + w_f_w
 
     # Pass 1: Pre-calculate total pages
     y_sim = margin_y + h_top + 6.0 * scale + h_doc + h_gap
@@ -1873,57 +2004,70 @@ def render_cutlist_pdf(
     p.setPen(border_pen)
     p.setBrush(Qt.NoBrush)
     p.drawRect(QRectF(margin_x, y, content_w, h_th))
-    p.drawLine(QPointF(x_col1, y), QPointF(x_col1, y + h_th))
-    p.drawLine(QPointF(x_col2, y), QPointF(x_col2, y + h_th))
-    p.drawLine(QPointF(x_col3, y), QPointF(x_col3, y + h_th))
-    p.drawLine(QPointF(x_col3, y + h_th / 2.0), QPointF(margin_x + content_w, y + h_th / 2.0))
-    p.drawLine(QPointF(x_col4, y + h_th / 2.0), QPointF(x_col4, y + h_th))
-    p.drawLine(QPointF(x_col5, y + h_th / 2.0), QPointF(x_col5, y + h_th))
+    p.drawLine(QPointF(x_s_col1, y), QPointF(x_s_col1, y + h_th))
+    p.drawLine(QPointF(x_s_col2, y), QPointF(x_s_col2, y + h_th))
+    p.drawLine(QPointF(x_s_col3, y), QPointF(x_s_col3, y + h_th))
+    p.drawLine(QPointF(x_s_col3, y + h_th / 2.0), QPointF(margin_x + content_w, y + h_th / 2.0))
+    p.drawLine(QPointF(x_s_col4, y + h_th / 2.0), QPointF(x_s_col4, y + h_th))
+    p.drawLine(QPointF(x_s_col5, y + h_th / 2.0), QPointF(x_s_col5, y + h_th))
 
     p.setFont(font_th)
     p.setPen(QColor("#111827"))
-    p.drawText(QRectF(x_col0, y, w_col0, h_th), Qt.AlignCenter, "Type")
-    p.drawText(QRectF(x_col1, y, w_col1, h_th), Qt.AlignCenter, "Material / Thickness")
-    p.drawText(QRectF(x_col2, y, w_col2, h_th), Qt.AlignCenter, "Quantity")
-    p.drawText(QRectF(x_col3, y, w_sub_total, h_th / 2.0), Qt.AlignCenter, "Σ Rough")
-    p.drawText(QRectF(x_col3, y + h_th / 2.0, w_col3, h_th / 2.0), Qt.AlignCenter, "Length")
-    p.drawText(QRectF(x_col4, y + h_th / 2.0, w_col4, h_th / 2.0), Qt.AlignCenter, "Area")
-    p.drawText(QRectF(x_col5, y + h_th / 2.0, w_col5, h_th / 2.0), Qt.AlignCenter, "Volume")
+    p.drawText(QRectF(x_s_col0, y, w_s_col0, h_th), Qt.AlignCenter, "Type")
+    p.drawText(QRectF(x_s_col1, y, w_s_col1, h_th), Qt.AlignCenter, "Material / Thickness")
+    p.drawText(QRectF(x_s_col2, y, w_s_col2, h_th), Qt.AlignCenter, "Quantity")
+    p.drawText(QRectF(x_s_col3, y, w_s_sub_total, h_th / 2.0), Qt.AlignCenter, "Σ Rough")
+    p.drawText(QRectF(x_s_col3, y + h_th / 2.0, w_s_col3, h_th / 2.0), Qt.AlignCenter, "Length")
+    p.drawText(QRectF(x_s_col4, y + h_th / 2.0, w_s_col4, h_th / 2.0), Qt.AlignCenter, "Area")
+    p.drawText(QRectF(x_s_col5, y + h_th / 2.0, w_s_col5, h_th / 2.0), Qt.AlignCenter, "Volume")
     p.restore()
     y += h_th
 
     # Summary Data Rows
     for mat_name, mat_entries in by_mat.items():
         qty_tot = sum(e.count for e in mat_entries)
+        tot_rough_len = sum(e.count * e.r_length for e in mat_entries)
+        tot_rough_area = sum(e.rough_total_area for e in mat_entries)
+        tot_rough_vol = sum(e.rough_total_volume for e in mat_entries)
+        has_allowance = any(e.r_length != e.length or e.r_thickness != e.thickness for e in mat_entries)
+
         p.save()
         p.setPen(border_pen)
         p.setBrush(Qt.NoBrush)
         p.drawRect(QRectF(margin_x, y, content_w, h_row))
-        p.drawLine(QPointF(x_col1, y), QPointF(x_col1, y + h_row))
-        p.drawLine(QPointF(x_col2, y), QPointF(x_col2, y + h_row))
-        p.drawLine(QPointF(x_col3, y), QPointF(x_col3, y + h_row))
-        p.drawLine(QPointF(x_col4, y), QPointF(x_col4, y + h_row))
-        p.drawLine(QPointF(x_col5, y), QPointF(x_col5, y + h_row))
+        p.drawLine(QPointF(x_s_col1, y), QPointF(x_s_col1, y + h_row))
+        p.drawLine(QPointF(x_s_col2, y), QPointF(x_s_col2, y + h_row))
+        p.drawLine(QPointF(x_s_col3, y), QPointF(x_s_col3, y + h_row))
+        p.drawLine(QPointF(x_s_col4, y), QPointF(x_s_col4, y + h_row))
+        p.drawLine(QPointF(x_s_col5, y), QPointF(x_s_col5, y + h_row))
 
-        draw_type_glyph(x_col0 + w_col0 / 2.0, y + h_row / 2.0, 10.0 * scale)
-        draw_circular_swatch(x_col1 + 14.0 * scale, y + h_row / 2.0, 5.5 * scale, mat_name)
+        draw_type_glyph(x_s_col0 + w_s_col0 / 2.0, y + h_row / 2.0, 10.0 * scale)
+        draw_circular_swatch(x_s_col1 + 14.0 * scale, y + h_row / 2.0, 5.5 * scale, mat_name)
 
         p.setFont(font_cell_italic)
         p.setPen(QColor("#111827"))
-        p.drawText(QRectF(x_col1 + 24.0 * scale, y, w_col1 - 28.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignLeft, mat_name)
+        p.drawText(QRectF(x_s_col1 + 24.0 * scale, y, w_s_col1 - 28.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignLeft, mat_name)
 
         p.setFont(font_cell)
-        p.drawText(QRectF(x_col2, y, w_col2, h_row), Qt.AlignCenter, str(qty_tot))
+        p.drawText(QRectF(x_s_col2, y, w_s_col2, h_row), Qt.AlignCenter, str(qty_tot))
 
-        draw_hatch(QRectF(x_col3, y, w_col3, h_row))
-        draw_hatch(QRectF(x_col4, y, w_col4, h_row))
-        draw_hatch(QRectF(x_col5, y, w_col5, h_row))
+        if has_allowance:
+            p.drawText(QRectF(x_s_col3, y, w_s_col3, h_row), Qt.AlignCenter, f"{format_dimension(tot_rough_len, unit)} {unit}")
+            p.drawText(QRectF(x_s_col4, y, w_s_col4, h_row), Qt.AlignCenter, format_area(tot_rough_area, unit))
+            p.drawText(QRectF(x_s_col5, y, w_s_col5, h_row), Qt.AlignCenter, format_volume(tot_rough_vol, unit))
+        else:
+            draw_hatch(QRectF(x_s_col3, y, w_s_col3, h_row))
+            tot_area = sum(e.total_area for e in mat_entries)
+            tot_vol = sum(e.total_volume for e in mat_entries)
+            p.drawText(QRectF(x_s_col4, y, w_s_col4, h_row), Qt.AlignCenter, format_area(tot_area, unit))
+            p.drawText(QRectF(x_s_col5, y, w_s_col5, h_row), Qt.AlignCenter, format_volume(tot_vol, unit))
+
         p.restore()
         y += h_row
 
     y += h_gap
 
-    # Material Section Tables
+    # Material Section Tables with Dual Rough & Finished Columns
     for mat_name, mat_entries in by_mat.items():
         if y + h_bar + h_th + h_row > content_bottom:
             draw_page_footer(curr_page)
@@ -1949,22 +2093,35 @@ def render_cutlist_pdf(
             p.setPen(border_pen)
             p.setBrush(Qt.NoBrush)
             p.drawRect(QRectF(margin_x, at_y, content_w, h_th))
-            p.drawLine(QPointF(x_col1, at_y), QPointF(x_col1, at_y + h_th))
-            p.drawLine(QPointF(x_col2, at_y), QPointF(x_col2, at_y + h_th))
-            p.drawLine(QPointF(x_col3, at_y), QPointF(x_col3, at_y + h_th))
-            p.drawLine(QPointF(x_col3, at_y + h_th / 2.0), QPointF(margin_x + content_w, at_y + h_th / 2.0))
-            p.drawLine(QPointF(x_col4, at_y + h_th / 2.0), QPointF(x_col4, at_y + h_th))
-            p.drawLine(QPointF(x_col5, at_y + h_th / 2.0), QPointF(x_col5, at_y + h_th))
+            p.drawLine(QPointF(x_m_col1, at_y), QPointF(x_m_col1, at_y + h_th))
+            p.drawLine(QPointF(x_m_col2, at_y), QPointF(x_m_col2, at_y + h_th))
+            p.drawLine(QPointF(x_m_rough, at_y), QPointF(x_m_rough, at_y + h_th))
+            p.drawLine(QPointF(x_m_fin, at_y), QPointF(x_m_fin, at_y + h_th))
+
+            # Super-headers horizontal split
+            p.drawLine(QPointF(x_m_rough, at_y + h_th / 2.0), QPointF(margin_x + content_w, at_y + h_th / 2.0))
+
+            # Rough sub-columns
+            p.drawLine(QPointF(x_m_r_w, at_y + h_th / 2.0), QPointF(x_m_r_w, at_y + h_th))
+            p.drawLine(QPointF(x_m_r_t, at_y + h_th / 2.0), QPointF(x_m_r_t, at_y + h_th))
+
+            # Finished sub-columns
+            p.drawLine(QPointF(x_m_f_w, at_y + h_th / 2.0), QPointF(x_m_f_w, at_y + h_th))
+            p.drawLine(QPointF(x_m_f_t, at_y + h_th / 2.0), QPointF(x_m_f_t, at_y + h_th))
 
             p.setFont(font_th)
             p.setPen(QColor("#111827"))
-            p.drawText(QRectF(x_col0, at_y, w_col0, h_th), Qt.AlignCenter, "No.")
-            p.drawText(QRectF(x_col1, at_y, w_col1, h_th), Qt.AlignCenter, "Designation")
-            p.drawText(QRectF(x_col2, at_y, w_col2, h_th), Qt.AlignCenter, "Qty.")
-            p.drawText(QRectF(x_col3, at_y, w_sub_total, h_th / 2.0), Qt.AlignCenter, "Finished")
-            p.drawText(QRectF(x_col3, at_y + h_th / 2.0, w_col3, h_th / 2.0), Qt.AlignCenter, "L")
-            p.drawText(QRectF(x_col4, at_y + h_th / 2.0, w_col4, h_th / 2.0), Qt.AlignCenter, "W")
-            p.drawText(QRectF(x_col5, at_y + h_th / 2.0, w_col5, h_th / 2.0), Qt.AlignCenter, "T")
+            p.drawText(QRectF(x_m_col0, at_y, w_m_col0, h_th), Qt.AlignCenter, "No.")
+            p.drawText(QRectF(x_m_col1, at_y, w_m_col1, h_th), Qt.AlignCenter, "Designation")
+            p.drawText(QRectF(x_m_col2, at_y, w_m_col2, h_th), Qt.AlignCenter, "Qty.")
+            p.drawText(QRectF(x_m_rough, at_y, w_m_rough, h_th / 2.0), Qt.AlignCenter, "Rough")
+            p.drawText(QRectF(x_m_r_l, at_y + h_th / 2.0, w_r_l, h_th / 2.0), Qt.AlignCenter, "L")
+            p.drawText(QRectF(x_m_r_w, at_y + h_th / 2.0, w_r_w, h_th / 2.0), Qt.AlignCenter, "W")
+            p.drawText(QRectF(x_m_r_t, at_y + h_th / 2.0, w_r_t, h_th / 2.0), Qt.AlignCenter, "T")
+            p.drawText(QRectF(x_m_fin, at_y, w_m_fin, h_th / 2.0), Qt.AlignCenter, "Finished")
+            p.drawText(QRectF(x_m_f_l, at_y + h_th / 2.0, w_f_l, h_th / 2.0), Qt.AlignCenter, "L")
+            p.drawText(QRectF(x_m_f_w, at_y + h_th / 2.0, w_f_w, h_th / 2.0), Qt.AlignCenter, "W")
+            p.drawText(QRectF(x_m_f_t, at_y + h_th / 2.0, w_f_t, h_th / 2.0), Qt.AlignCenter, "T")
             p.restore()
 
         draw_mat_th(y)
@@ -1983,33 +2140,38 @@ def render_cutlist_pdf(
             p.setPen(border_pen)
             p.setBrush(Qt.NoBrush)
             p.drawRect(QRectF(margin_x, y, content_w, h_row))
-            p.drawLine(QPointF(x_col1, y), QPointF(x_col1, y + h_row))
-            p.drawLine(QPointF(x_col2, y), QPointF(x_col2, y + h_row))
-            p.drawLine(QPointF(x_col3, y), QPointF(x_col3, y + h_row))
-            p.drawLine(QPointF(x_col4, y), QPointF(x_col4, y + h_row))
-            p.drawLine(QPointF(x_col5, y), QPointF(x_col5, y + h_row))
+            p.drawLine(QPointF(x_m_col1, y), QPointF(x_m_col1, y + h_row))
+            p.drawLine(QPointF(x_m_col2, y), QPointF(x_m_col2, y + h_row))
+            p.drawLine(QPointF(x_m_rough, y), QPointF(x_m_rough, y + h_row))
+            p.drawLine(QPointF(x_m_r_w, y), QPointF(x_m_r_w, y + h_row))
+            p.drawLine(QPointF(x_m_r_t, y), QPointF(x_m_r_t, y + h_row))
+            p.drawLine(QPointF(x_m_fin, y), QPointF(x_m_fin, y + h_row))
+            p.drawLine(QPointF(x_m_f_w, y), QPointF(x_m_f_w, y + h_row))
+            p.drawLine(QPointF(x_m_f_t, y), QPointF(x_m_f_t, y + h_row))
 
             # Red callout tag
             tag_clean = e.tag.replace("(", "").replace(")", "").strip()
             p.setFont(font_tag_red)
             p.setPen(QColor("#d32f2f"))
-            p.drawText(QRectF(x_col0, y, w_col0, h_row), Qt.AlignCenter, tag_clean)
+            p.drawText(QRectF(x_m_col0, y, w_m_col0, h_row), Qt.AlignCenter, tag_clean)
 
             # Designation
             p.setFont(font_cell)
             p.setPen(QColor("#111827"))
-            p.drawText(QRectF(x_col1 + 8.0 * scale, y, w_col1 - 16.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignLeft, e.display_name)
+            p.drawText(QRectF(x_m_col1 + 6.0 * scale, y, w_m_col1 - 12.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignLeft, e.display_name)
 
             # Qty
-            p.drawText(QRectF(x_col2, y, w_col2, h_row), Qt.AlignCenter, str(e.count))
+            p.drawText(QRectF(x_m_col2, y, w_m_col2, h_row), Qt.AlignCenter, str(e.count))
 
-            # L, W, T with unit
-            dim_l = f"{format_dimension(e.length, unit)} {unit}"
-            dim_w = f"{format_dimension(e.width, unit)} {unit}"
-            dim_t = f"{format_dimension(e.thickness, unit)} {unit}"
-            p.drawText(QRectF(x_col3, y, w_col3, h_row), Qt.AlignCenter, dim_l)
-            p.drawText(QRectF(x_col4, y, w_col4, h_row), Qt.AlignCenter, dim_w)
-            p.drawText(QRectF(x_col5, y, w_col5, h_row), Qt.AlignCenter, dim_t)
+            # Rough L, W, T
+            p.drawText(QRectF(x_m_r_l, y, w_r_l, h_row), Qt.AlignCenter, f"{format_dimension(e.r_length, unit)} {unit}")
+            p.drawText(QRectF(x_m_r_w, y, w_r_w, h_row), Qt.AlignCenter, f"{format_dimension(e.r_width, unit)} {unit}")
+            p.drawText(QRectF(x_m_r_t, y, w_r_t, h_row), Qt.AlignCenter, f"{format_dimension(e.r_thickness, unit)} {unit}")
+
+            # Finished L, W, T
+            p.drawText(QRectF(x_m_f_l, y, w_f_l, h_row), Qt.AlignCenter, f"{format_dimension(e.length, unit)} {unit}")
+            p.drawText(QRectF(x_m_f_w, y, w_f_w, h_row), Qt.AlignCenter, f"{format_dimension(e.width, unit)} {unit}")
+            p.drawText(QRectF(x_m_f_t, y, w_f_t, h_row), Qt.AlignCenter, f"{format_dimension(e.thickness, unit)} {unit}")
             p.restore()
             y += h_row
 
@@ -3673,7 +3835,8 @@ if QT_AVAILABLE:
             self.lumber_by_mat: Dict[str, List[LumberBoard]] = {}
             self.current_mat_name: str = ""
             self.current_page: int = 0
-            self._sort_col: int = 7  # Default: Thickness (Column 7 in 10-column table)
+            self.table_view_mode: str = "both"  # "both", "finished", "rough"
+            self._sort_col: int = 10  # Default: Rough Thickness (Column 10 in 13-column 'both' table)
             self._sort_asc: bool = False  # Default: Descending (thickest first)
             self._thumbnail_cache: Dict[str, Tuple[Any, Any]] = {}
 
@@ -3732,7 +3895,7 @@ if QT_AVAILABLE:
             settings_layout = QHBoxLayout(settings_group)
             settings_layout.setSpacing(16)
 
-            # Col 1: General
+            # Col 1: General & Rough Allowances
             col1 = QFormLayout()
             self.unit_combo = QComboBox()
             self.unit_combo.addItems(["mm", "cm", "m", "in"])
@@ -3749,7 +3912,46 @@ if QT_AVAILABLE:
             self.kerf_spin.setValue(3.0)
             self.kerf_spin.setSuffix(" mm")
             col1.addRow("Blade Kerf (Cut Gap):", self.kerf_spin)
-            settings_layout.addLayout(col1, stretch=1)
+
+            # Rough Cut Allowances (+T, +L, +W)
+            rough_allow_layout = QHBoxLayout()
+            self.rough_t_spin = QDoubleSpinBox()
+            self.rough_t_spin.setRange(0.0, 50.0)
+            self.rough_t_spin.setValue(2.0)
+            self.rough_t_spin.setSuffix(" mm")
+            self.rough_t_spin.setToolTip("Rough over-thickness allowance (+T) e.g. 2mm (18mm finish from 20mm rough stock)")
+
+            self.rough_l_spin = QDoubleSpinBox()
+            self.rough_l_spin.setRange(0.0, 200.0)
+            self.rough_l_spin.setValue(20.0)
+            self.rough_l_spin.setSuffix(" mm")
+            self.rough_l_spin.setToolTip("Rough over-length allowance (+L) for squaring ends")
+
+            self.rough_w_spin = QDoubleSpinBox()
+            self.rough_w_spin.setRange(0.0, 100.0)
+            self.rough_w_spin.setValue(6.0)
+            self.rough_w_spin.setSuffix(" mm")
+            self.rough_w_spin.setToolTip("Rough over-width allowance (+W) for jointing edges")
+
+            rough_allow_layout.addWidget(QLabel("T+"))
+            rough_allow_layout.addWidget(self.rough_t_spin)
+            rough_allow_layout.addWidget(QLabel("L+"))
+            rough_allow_layout.addWidget(self.rough_l_spin)
+            rough_allow_layout.addWidget(QLabel("W+"))
+            rough_allow_layout.addWidget(self.rough_w_spin)
+            col1.addRow("Rough Allowances (+):", rough_allow_layout)
+
+            self.rough_solid_only = QCheckBox("Solid wood only (0 on sheets)")
+            self.rough_solid_only.setChecked(True)
+            self.rough_solid_only.setToolTip("Apply rough cut allowances only to solid wood and linear lumber; sheet goods stay at 1:1 net size.")
+            col1.addRow("Rough Target:", self.rough_solid_only)
+
+            self.rough_t_spin.valueChanged.connect(self._on_rough_allowances_changed)
+            self.rough_l_spin.valueChanged.connect(self._on_rough_allowances_changed)
+            self.rough_w_spin.valueChanged.connect(self._on_rough_allowances_changed)
+            self.rough_solid_only.toggled.connect(self._on_rough_allowances_changed)
+
+            settings_layout.addLayout(col1, stretch=2)
 
             # Col 2: Material Table
             col2 = QVBoxLayout()
@@ -3824,6 +4026,14 @@ if QT_AVAILABLE:
             self.search_input.setPlaceholderText("Filter by part name...")
             self.search_input.textChanged.connect(self._apply_table_filter)
             filter_box.addWidget(self.search_input, stretch=2)
+
+            filter_box.addWidget(QLabel("<b>Table View:</b>"))
+            self.table_view_combo = QComboBox()
+            self.table_view_combo.addItem("🪚 Rough & Finished (Both)", "both")
+            self.table_view_combo.addItem("🎯 Finished Cut Only", "finished")
+            self.table_view_combo.addItem("🪵 Rough Cut Only", "rough")
+            self.table_view_combo.currentIndexChanged.connect(self._on_table_view_changed)
+            filter_box.addWidget(self.table_view_combo, stretch=1)
 
             filter_box.addWidget(QLabel("<b>Material:</b>"))
             self.material_filter_combo = QComboBox()
@@ -4105,10 +4315,49 @@ if QT_AVAILABLE:
             self.sheet_w_spin.setSuffix(f" {unit}")
             self.sheet_h_spin.setSuffix(f" {unit}")
             self.kerf_spin.setSuffix(f" {unit}")
+            if hasattr(self, "rough_t_spin"):
+                self.rough_t_spin.setSuffix(f" {unit}")
+                self.rough_l_spin.setSuffix(f" {unit}")
+                self.rough_w_spin.setSuffix(f" {unit}")
             if self.entries:
+                self._update_rough_dimensions()
                 self._populate_table(self.entries)
                 self._update_active_diagram()
                 self.drawing_widget.set_data(self.raw_parts, self.entries, unit)
+
+        def _update_rough_dimensions(self) -> None:
+            u = self.unit_combo.currentText()
+            factor = UNIT_FACTORS.get(u, 1000.0)
+            over_t = (self.rough_t_spin.value() / factor) if hasattr(self, "rough_t_spin") else 0.002
+            over_l = (self.rough_l_spin.value() / factor) if hasattr(self, "rough_l_spin") else 0.020
+            over_w = (self.rough_w_spin.value() / factor) if hasattr(self, "rough_w_spin") else 0.006
+            solid_only = self.rough_solid_only.isChecked() if hasattr(self, "rough_solid_only") else True
+
+            update_entries_rough_dimensions(
+                self.entries,
+                self.material_types,
+                over_length=over_l,
+                over_width=over_w,
+                over_thickness=over_t,
+                apply_to_solid_only=solid_only,
+            )
+
+        def _on_rough_allowances_changed(self) -> None:
+            if self.entries:
+                self._update_rough_dimensions()
+                self._apply_table_filter()
+
+        def _on_table_view_changed(self) -> None:
+            if hasattr(self, "table_view_combo"):
+                data = self.table_view_combo.currentData()
+                self.table_view_mode = data if data else "both"
+            if self.table_view_mode == "both":
+                self._sort_col = 10  # Rough Thick
+            elif self.table_view_mode == "rough":
+                self._sort_col = 7   # Rough Thick
+            else:
+                self._sort_col = 7   # Finished Thick
+            self._apply_table_filter()
 
         def _on_slider_exploded(self, val: int) -> None:
             self.slider_label.setText(f"{val}%")
@@ -4144,6 +4393,7 @@ if QT_AVAILABLE:
             # 1. Group parts
             merge = self.group_toggle.isChecked()
             self.entries = group_parts(self.raw_parts, merge_by_dimensions=merge)
+            self._update_rough_dimensions()
 
             # 2. Material Diagrams
             self.sheets_by_mat.clear()
@@ -4210,20 +4460,24 @@ if QT_AVAILABLE:
             sys.stdout.flush()
 
         def _on_thick_sort_changed(self) -> None:
-            self._sort_col = 7
+            mode = getattr(self, "table_view_mode", "both")
+            self._sort_col = 10 if mode == "both" else 7
             self._sort_asc = (self.thick_sort_combo.currentIndex() == 1)
             self._apply_table_filter()
 
         def _on_table_header_clicked(self, col: int) -> None:
             current_col = getattr(self, "_sort_col", 7)
             current_asc = getattr(self, "_sort_asc", False)
+            mode = getattr(self, "table_view_mode", "both")
             if col == current_col:
                 new_asc = not current_asc
             else:
-                new_asc = False if col in (4, 5, 6, 7, 9) else True
+                numeric_cols = (4, 5, 6, 7, 8, 9, 10, 12) if mode == "both" else (4, 5, 6, 7, 9)
+                new_asc = False if col in numeric_cols else True
             self._sort_col = col
             self._sort_asc = new_asc
-            if col == 7 and hasattr(self, "thick_sort_combo"):
+            thick_col = 10 if mode == "both" else 7
+            if col == thick_col and hasattr(self, "thick_sort_combo"):
                 self.thick_sort_combo.blockSignals(True)
                 self.thick_sort_combo.setCurrentIndex(1 if new_asc else 0)
                 self.thick_sort_combo.blockSignals(False)
@@ -4240,34 +4494,79 @@ if QT_AVAILABLE:
                 and (mat_filter == "All Materials" or e.material == mat_filter)
             ]
 
-            col = getattr(self, "_sort_col", 7)
+            mode = getattr(self, "table_view_mode", "both")
+            col = getattr(self, "_sort_col", 10 if mode == "both" else 7)
             asc = getattr(self, "_sort_asc", False)
 
             def sort_key(e: CutListEntry):
-                if col == 0 or col == 8:
-                    return e.material.lower()
-                elif col == 1 or col == 2:
-                    return e.tag
-                elif col == 3:
-                    return e.display_name.lower()
-                elif col == 4:
-                    return e.count
-                elif col == 5:
-                    return e.length
-                elif col == 6:
-                    return e.width
-                elif col == 7:
+                if mode == "both":
+                    if col in (0, 11):
+                        return e.material.lower()
+                    elif col in (1, 2):
+                        return e.tag
+                    elif col == 3:
+                        return e.display_name.lower()
+                    elif col == 4:
+                        return e.count
+                    elif col == 5:
+                        return e.length
+                    elif col == 6:
+                        return e.width
+                    elif col == 7:
+                        return e.thickness
+                    elif col == 8:
+                        return e.r_length
+                    elif col == 9:
+                        return e.r_width
+                    elif col == 10:
+                        return e.r_thickness
+                    elif col == 12:
+                        return e.total_area
+                    return e.r_thickness
+                elif mode == "rough":
+                    if col in (0, 8):
+                        return e.material.lower()
+                    elif col in (1, 2):
+                        return e.tag
+                    elif col == 3:
+                        return e.display_name.lower()
+                    elif col == 4:
+                        return e.count
+                    elif col == 5:
+                        return e.r_length
+                    elif col == 6:
+                        return e.r_width
+                    elif col == 7:
+                        return e.r_thickness
+                    elif col == 9:
+                        return e.rough_total_area
+                    return e.r_thickness
+                else:  # "finished"
+                    if col in (0, 8):
+                        return e.material.lower()
+                    elif col in (1, 2):
+                        return e.tag
+                    elif col == 3:
+                        return e.display_name.lower()
+                    elif col == 4:
+                        return e.count
+                    elif col == 5:
+                        return e.length
+                    elif col == 6:
+                        return e.width
+                    elif col == 7:
+                        return e.thickness
+                    elif col == 9:
+                        return e.total_area
                     return e.thickness
-                elif col == 9:
-                    return e.total_area
-                return e.thickness
 
             by_mat: Dict[str, List[CutListEntry]] = {}
             for e in filtered:
                 by_mat.setdefault(e.material, []).append(e)
 
             sorted_filtered: List[CutListEntry] = []
-            mat_names = sorted(by_mat.keys(), key=lambda m: m.lower(), reverse=(col in (0, 8) and not asc))
+            mat_cols = (0, 11) if mode == "both" else (0, 8)
+            mat_names = sorted(by_mat.keys(), key=lambda m: m.lower(), reverse=(col in mat_cols and not asc))
             for m in mat_names:
                 m_list = by_mat[m]
                 m_list.sort(key=sort_key, reverse=not asc)
@@ -4436,6 +4735,7 @@ if QT_AVAILABLE:
             # 4. Regroup parts with current grouping mode
             merge = self.group_toggle.isChecked()
             self.entries = group_parts(self.raw_parts, merge_by_dimensions=merge)
+            self._update_rough_dimensions()
 
             # 5. Re-pack cutting diagrams
             u = self.unit_combo.currentText()
@@ -4507,11 +4807,27 @@ if QT_AVAILABLE:
         def _populate_table(self, entries: List[CutListEntry]) -> None:
             u = self.unit_combo.currentText()
             area_u = AREA_UNITS.get(u, "m²")
-            headers = [
-                "Mat", "Tag", "#", "Part Name / Description", "Qty",
-                f"Length ({u})", f"Width ({u})", f"Thick ({u})",
-                "Material", f"Total Area ({area_u})"
-            ]
+            mode = getattr(self, "table_view_mode", "both")
+
+            if mode == "both":
+                headers = [
+                    "Mat", "Tag", "#", "Part Name / Description", "Qty",
+                    f"Fin L ({u})", f"Fin W ({u})", f"Fin T ({u})",
+                    f"Rough L ({u})", f"Rough W ({u})", f"Rough T ({u})",
+                    "Material", f"Total Area ({area_u})"
+                ]
+            elif mode == "rough":
+                headers = [
+                    "Mat", "Tag", "#", "Part Name / Description", "Qty",
+                    f"Rough L ({u})", f"Rough W ({u})", f"Rough T ({u})",
+                    "Material", f"Rough Area ({area_u})"
+                ]
+            else:  # "finished"
+                headers = [
+                    "Mat", "Tag", "#", "Part Name / Description", "Qty",
+                    f"Length ({u})", f"Width ({u})", f"Thick ({u})",
+                    "Material", f"Total Area ({area_u})"
+                ]
 
             self.table.clear()
             self.table.setColumnCount(len(headers))
@@ -4544,7 +4860,6 @@ if QT_AVAILABLE:
             row_idx = 0
             part_num = 1
             scene = getattr(self.viewport, "scene", None) if hasattr(self, "viewport") else None
-            available_materials = self._get_available_materials()
 
             for mat_name, mat_entries in mat_groups:
                 mat_parts_count = sum(e.count for e in mat_entries)
@@ -4554,7 +4869,16 @@ if QT_AVAILABLE:
 
                 _, mat_icon = get_material_thumbnail(mat_name, scene=scene, size=22, cache=self._thumbnail_cache)
 
-                header_text = f"  📁 Material: {mat_name}  ({st_info})  —  {mat_parts_count} parts  |  Total Area: {area_str}"
+                has_diff = any(e.r_thickness != e.thickness or e.r_length != e.length for e in mat_entries)
+                if has_diff:
+                    avg_r_t = sum(e.r_thickness * e.count for e in mat_entries) / max(1, mat_parts_count)
+                    avg_f_t = sum(e.thickness * e.count for e in mat_entries) / max(1, mat_parts_count)
+                    dim_info = f"  |  Rough: {format_dimension(avg_r_t, u)} {u} (Finished: {format_dimension(avg_f_t, u)} {u})"
+                else:
+                    avg_t = sum(e.thickness * e.count for e in mat_entries) / max(1, mat_parts_count)
+                    dim_info = f"  |  Thick: {format_dimension(avg_t, u)} {u}"
+
+                header_text = f"  📁 Material: {mat_name}  ({st_info})  —  {mat_parts_count} parts{dim_info}  |  Total Area: {area_str}"
                 header_item = QTableWidgetItem(header_text)
                 header_item.setFlags(Qt.ItemIsEnabled)
                 font_h = header_item.font()
@@ -4601,89 +4925,125 @@ if QT_AVAILABLE:
                     # Column 4: Qty
                     self.table.setItem(row_idx, 4, NumericTableWidgetItem(str(e.count), float(e.count)))
 
-                    # Column 5: Length
-                    self.table.setItem(row_idx, 5, NumericTableWidgetItem(format_dimension(e.length, u), e.length))
+                    # Helper for Material button cell widget
+                    def _make_mat_btn(entry=e):
+                        cw = QWidget()
+                        cl = QHBoxLayout(cw)
+                        cl.setContentsMargins(2, 2, 2, 2)
+                        cl.setSpacing(0)
+                        btn = QPushButton()
+                        if mat_icon is not None and not mat_icon.isNull():
+                            btn.setIcon(mat_icon)
+                            btn.setIconSize(QSize(18, 18))
+                        btn.setText(f"  {entry.material}   ▾")
+                        btn.setToolTip(f"Click to change material for '{entry.display_name}' (Current: {entry.material})\nOpens Material Library Dialog — Click 'Save Material' to apply.")
+                        btn.setCursor(Qt.PointingHandCursor)
+                        btn.setStyleSheet("""
+                            QPushButton {
+                                background-color: #1e293b;
+                                color: #f1f5f9;
+                                border: 1px solid #475569;
+                                border-radius: 4px;
+                                padding: 3px 8px;
+                                font-size: 11px;
+                                text-align: left;
+                            }
+                            QPushButton:hover {
+                                background-color: #334155;
+                                border-color: #38bdf8;
+                                color: #ffffff;
+                            }
+                            QPushButton:pressed {
+                                background-color: #0284c7;
+                            }
+                        """)
+                        btn.clicked.connect(lambda _c, ent=entry: self._open_material_library_dialog(ent))
+                        cl.addWidget(btn)
+                        return cw
 
-                    # Column 6: Width
-                    self.table.setItem(row_idx, 6, NumericTableWidgetItem(format_dimension(e.width, u), e.width))
+                    if mode == "both":
+                        # Col 5: Finished Length
+                        self.table.setItem(row_idx, 5, NumericTableWidgetItem(format_dimension(e.length, u), e.length))
+                        # Col 6: Finished Width
+                        self.table.setItem(row_idx, 6, NumericTableWidgetItem(format_dimension(e.width, u), e.width))
+                        # Col 7: Finished Thick
+                        self.table.setItem(row_idx, 7, NumericTableWidgetItem(format_dimension(e.thickness, u), e.thickness))
+                        # Col 8: Rough Length
+                        self.table.setItem(row_idx, 8, NumericTableWidgetItem(format_dimension(e.r_length, u), e.r_length))
+                        # Col 9: Rough Width
+                        self.table.setItem(row_idx, 9, NumericTableWidgetItem(format_dimension(e.r_width, u), e.r_width))
+                        # Col 10: Rough Thick (highlighted)
+                        rgh_thk = NumericTableWidgetItem(format_dimension(e.r_thickness, u), e.r_thickness)
+                        font_rth = rgh_thk.font()
+                        font_rth.setBold(True)
+                        rgh_thk.setFont(font_rth)
+                        rgh_thk.setForeground(QColor("#f59e0b"))
+                        self.table.setItem(row_idx, 10, rgh_thk)
+                        # Col 11: Material Button
+                        self.table.setCellWidget(row_idx, 11, _make_mat_btn())
+                        # Col 12: Total Area
+                        area_val = e.total_area * (10.7639 if u == "in" else 1.0)
+                        self.table.setItem(row_idx, 12, NumericTableWidgetItem(f"{area_val:.2f}", area_val))
 
-                    # Column 7: Thick (highlighted)
-                    thick_item = NumericTableWidgetItem(format_dimension(e.thickness, u), e.thickness)
-                    font_thk = thick_item.font()
-                    font_thk.setBold(True)
-                    thick_item.setFont(font_thk)
-                    thick_item.setForeground(QColor("#f59e0b"))
-                    self.table.setItem(row_idx, 7, thick_item)
+                    elif mode == "rough":
+                        # Col 5: Rough Length
+                        self.table.setItem(row_idx, 5, NumericTableWidgetItem(format_dimension(e.r_length, u), e.r_length))
+                        # Col 6: Rough Width
+                        self.table.setItem(row_idx, 6, NumericTableWidgetItem(format_dimension(e.r_width, u), e.r_width))
+                        # Col 7: Rough Thick (highlighted)
+                        rgh_thk = NumericTableWidgetItem(format_dimension(e.r_thickness, u), e.r_thickness)
+                        font_rth = rgh_thk.font()
+                        font_rth.setBold(True)
+                        rgh_thk.setFont(font_rth)
+                        rgh_thk.setForeground(QColor("#f59e0b"))
+                        self.table.setItem(row_idx, 7, rgh_thk)
+                        # Col 8: Material Button
+                        self.table.setCellWidget(row_idx, 8, _make_mat_btn())
+                        # Col 9: Rough Total Area
+                        area_val = e.rough_total_area * (10.7639 if u == "in" else 1.0)
+                        self.table.setItem(row_idx, 9, NumericTableWidgetItem(f"{area_val:.2f}", area_val))
 
-                    # Column 8: Material Button (Click to open material picker dialog; ignores mouse wheel)
-                    cell_widget = QWidget()
-                    cell_layout = QHBoxLayout(cell_widget)
-                    cell_layout.setContentsMargins(2, 2, 2, 2)
-                    cell_layout.setSpacing(0)
-
-                    mat_btn = QPushButton()
-                    if mat_icon is not None and not mat_icon.isNull():
-                        mat_btn.setIcon(mat_icon)
-                        mat_btn.setIconSize(QSize(18, 18))
-                    mat_btn.setText(f"  {e.material}   ▾")
-                    mat_btn.setToolTip(f"Click to change material for '{e.display_name}' (Current: {e.material})\nOpens Material Library Dialog — Click 'Save Material' to apply.")
-                    mat_btn.setCursor(Qt.PointingHandCursor)
-                    mat_btn.setStyleSheet("""
-                        QPushButton {
-                            background-color: #1e293b;
-                            color: #f1f5f9;
-                            border: 1px solid #475569;
-                            border-radius: 4px;
-                            padding: 3px 8px;
-                            font-size: 11px;
-                            text-align: left;
-                        }
-                        QPushButton:hover {
-                            background-color: #334155;
-                            border-color: #38bdf8;
-                            color: #ffffff;
-                        }
-                        QPushButton:pressed {
-                            background-color: #0284c7;
-                        }
-                    """)
-                    mat_btn.clicked.connect(
-                        lambda _checked, entry=e: self._open_material_library_dialog(entry)
-                    )
-                    cell_layout.addWidget(mat_btn)
-
-                    self.table.setCellWidget(row_idx, 8, cell_widget)
-
-                    # Column 9: Total Area
-                    area_val = e.total_area * (10.7639 if u == "in" else 1.0)
-                    self.table.setItem(row_idx, 9, NumericTableWidgetItem(f"{area_val:.2f}", area_val))
+                    else:  # "finished"
+                        # Col 5: Length
+                        self.table.setItem(row_idx, 5, NumericTableWidgetItem(format_dimension(e.length, u), e.length))
+                        # Col 6: Width
+                        self.table.setItem(row_idx, 6, NumericTableWidgetItem(format_dimension(e.width, u), e.width))
+                        # Col 7: Thick (highlighted)
+                        thick_item = NumericTableWidgetItem(format_dimension(e.thickness, u), e.thickness)
+                        font_thk = thick_item.font()
+                        font_thk.setBold(True)
+                        thick_item.setFont(font_thk)
+                        thick_item.setForeground(QColor("#f59e0b"))
+                        self.table.setItem(row_idx, 7, thick_item)
+                        # Col 8: Material Button
+                        self.table.setCellWidget(row_idx, 8, _make_mat_btn())
+                        # Col 9: Total Area
+                        area_val = e.total_area * (10.7639 if u == "in" else 1.0)
+                        self.table.setItem(row_idx, 9, NumericTableWidgetItem(f"{area_val:.2f}", area_val))
 
                     self.table.setRowHeight(row_idx, 28)
                     row_idx += 1
                     part_num += 1
 
             h = self.table.horizontalHeader()
-            h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-            h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-            h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-            h.setSectionResizeMode(3, QHeaderView.Stretch)
-            h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-            h.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-            h.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-            h.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-            h.setSectionResizeMode(8, QHeaderView.ResizeToContents)
-            h.setSectionResizeMode(9, QHeaderView.ResizeToContents)
+            for c_i in range(len(headers)):
+                if headers[c_i] == "Part Name / Description":
+                    h.setSectionResizeMode(c_i, QHeaderView.Stretch)
+                else:
+                    h.setSectionResizeMode(c_i, QHeaderView.ResizeToContents)
 
             h.setSortIndicatorShown(True)
-            sort_c = getattr(self, "_sort_col", 7)
+            sort_c = min(getattr(self, "_sort_col", 7), len(headers) - 1)
             sort_a = getattr(self, "_sort_asc", False)
             h.setSortIndicator(sort_c, Qt.AscendingOrder if sort_a else Qt.DescendingOrder)
 
             tot_parts = sum(e.count for e in entries)
             tot_area = sum(e.total_area for e in entries)
+            tot_vol = sum(e.rough_total_volume for e in entries)
+            vol_str = format_volume(tot_vol, u)
             self.summary_label.setText(
                 f"Total Parts: {tot_parts}   |   Unique Sizes: {len(entries)}   |   "
-                f"Materials: {len(mat_groups)}   |   Total Surface Area: {format_area(tot_area, u)}"
+                f"Materials: {len(mat_groups)}   |   Surface Area: {format_area(tot_area, u)}   |   Σ Rough Volume: {vol_str}"
             )
 
         def _on_material_diagram_changed(self) -> None:
@@ -4765,13 +5125,19 @@ if QT_AVAILABLE:
         def _copy_tsv(self) -> None:
             u = self.unit_combo.currentText()
             area_u = AREA_UNITS.get(u, "m²")
-            headers = ["Tag", "#", "Part Name", "Qty", f"Length ({u})", f"Width ({u})", f"Thickness ({u})", "Material", f"Total Area ({area_u})"]
+            headers = [
+                "Tag", "#", "Part Name", "Qty",
+                f"Fin Length ({u})", f"Fin Width ({u})", f"Fin Thick ({u})",
+                f"Rough Length ({u})", f"Rough Width ({u})", f"Rough Thick ({u})",
+                "Material", f"Total Area ({area_u})"
+            ]
             rows = ["\t".join(headers)]
             for idx, e in enumerate(self.entries, start=1):
                 area_val = e.total_area * (10.7639 if u == "in" else 1.0)
                 row = [
                     e.tag, str(idx), e.display_name, str(e.count),
                     format_dimension(e.length, u), format_dimension(e.width, u), format_dimension(e.thickness, u),
+                    format_dimension(e.r_length, u), format_dimension(e.r_width, u), format_dimension(e.r_thickness, u),
                     e.material, f"{area_val:.2f}",
                 ]
                 rows.append("\t".join(row))
@@ -4790,13 +5156,20 @@ if QT_AVAILABLE:
                 area_u = AREA_UNITS.get(u, "m²")
                 with open(path, "w", newline="", encoding="utf-8") as f:
                     w = csv.writer(f)
-                    w.writerow(["Tag", "#", "Part Name", "Qty", f"Length ({u})", f"Width ({u})", f"Thickness ({u})", "Material", f"Total Area ({area_u})"])
+                    w.writerow([
+                        "Tag", "#", "Part Name", "Qty",
+                        f"Finished Length ({u})", f"Finished Width ({u})", f"Finished Thickness ({u})",
+                        f"Rough Length ({u})", f"Rough Width ({u})", f"Rough Thickness ({u})",
+                        "Material", f"Total Area ({area_u})", "Rough Volume"
+                    ])
                     for idx, e in enumerate(self.entries, start=1):
                         area_val = e.total_area * (10.7639 if u == "in" else 1.0)
+                        vol_str = format_volume(e.rough_total_volume, u)
                         w.writerow([
                             e.tag, idx, e.display_name, e.count,
                             format_dimension(e.length, u), format_dimension(e.width, u), format_dimension(e.thickness, u),
-                            e.material, f"{area_val:.2f}",
+                            format_dimension(e.r_length, u), format_dimension(e.r_width, u), format_dimension(e.r_thickness, u),
+                            e.material, f"{area_val:.2f}", vol_str
                         ])
                 QMessageBox.information(self, "Complete", f"Cut list exported to:\n{path}")
             except Exception as e:
