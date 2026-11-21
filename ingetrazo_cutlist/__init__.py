@@ -3094,6 +3094,7 @@ if QT_AVAILABLE:
 
             self.show_callouts = True
             self.show_legend = True
+            self.outline_mode = False
 
             self._last_mouse_pos = QPoint()
             self._is_orbiting = False
@@ -3506,7 +3507,8 @@ if QT_AVAILABLE:
             painter.setFont(font_meta)
             painter.setPen(QColor("#475569"))
 
-            meta_text = f"Exploded View  |  Parts: {len(self.parts)}  |  Units: {self.unit}  |  Explosion: {int(self.explode_factor * 100)}%"
+            view_mode_name = "Outline" if self.outline_mode else "Exploded" if self.explode_factor > 0 else "Assembly"
+            meta_text = f"{view_mode_name} View  |  Parts: {len(self.parts)}  |  Units: {self.unit}  |  Explosion: {int(self.explode_factor * 100)}%"
             painter.drawText(title_box, Qt.AlignRight | Qt.AlignVCenter, meta_text)
 
             div_y = inner_rect.top() + (44.0 * ui_scale)
@@ -3529,7 +3531,7 @@ if QT_AVAILABLE:
             pan_x = self.pan_x * (ui_scale if is_export else 1.0)
             pan_y = self.pan_y * (ui_scale if is_export else 1.0)
 
-            if self._cached_image is not None and not self._cached_image.isNull():
+            if not self.outline_mode and self._cached_image is not None and not self._cached_image.isNull():
                 target_img_rect = QRectF(draw_rect.left() + pan_x, draw_rect.top() + pan_y, draw_rect.width(), draw_rect.height())
                 painter.drawImage(target_img_rect, self._cached_image)
 
@@ -3635,15 +3637,18 @@ if QT_AVAILABLE:
                 part_centers_2d.append((p2d_x, p2d_y, part.tag, part.name))
 
                 # Material color assignment
-                mat_lower = (part.material or "").lower()
-                if "metal" in mat_lower:
-                    base_color = QColor("#a0a5aa")
-                elif "gold" in mat_lower:
-                    base_color = QColor("#c5a059")
-                elif "glass" in mat_lower:
-                    base_color = QColor("#b0d4e3")
+                if self.outline_mode:
+                    base_color = QColor("#ffffff")
                 else:
-                    base_color = wood_palette[p_idx % len(wood_palette)]
+                    mat_lower = (part.material or "").lower()
+                    if "metal" in mat_lower:
+                        base_color = QColor("#a0a5aa")
+                    elif "gold" in mat_lower:
+                        base_color = QColor("#c5a059")
+                    elif "glass" in mat_lower:
+                        base_color = QColor("#b0d4e3")
+                    else:
+                        base_color = wood_palette[p_idx % len(wood_palette)]
 
                 # True 3D mesh faces (including curved arch segments)
                 part_faces = part.faces_3d if (part.faces_3d and len(part.faces_3d) > 0) else []
@@ -3671,18 +3676,21 @@ if QT_AVAILABLE:
                     dot_f = nx * fx + ny * fy + nz * fz
 
                     # Two-sided shading: guarantees thin panels and reverse-wound faces are always rendered
-                    if dot_f >= 0:
-                        dot_l = max(0.0, nx * lx + ny * ly + nz * lz)
-                        intensity = 0.65 + (0.35 * dot_l)
+                    if self.outline_mode:
+                        shaded_color = QColor("#ffffff")
                     else:
-                        dot_l = max(0.0, (-nx) * lx + (-ny) * ly + (-nz) * lz)
-                        intensity = 0.48 + (0.30 * dot_l)
+                        if dot_f >= 0:
+                            dot_l = max(0.0, nx * lx + ny * ly + nz * lz)
+                            intensity = 0.65 + (0.35 * dot_l)
+                        else:
+                            dot_l = max(0.0, (-nx) * lx + (-ny) * ly + (-nz) * lz)
+                            intensity = 0.48 + (0.30 * dot_l)
 
-                    shaded_color = QColor(
-                        max(0, min(255, int(base_color.red() * intensity))),
-                        max(0, min(255, int(base_color.green() * intensity))),
-                        max(0, min(255, int(base_color.blue() * intensity))),
-                    )
+                        shaded_color = QColor(
+                            max(0, min(255, int(base_color.red() * intensity))),
+                            max(0, min(255, int(base_color.green() * intensity))),
+                            max(0, min(255, int(base_color.blue() * intensity))),
+                        )
 
                     pts_2d = []
                     v_depths = []
@@ -3709,7 +3717,9 @@ if QT_AVAILABLE:
             faces_to_render.sort(key=lambda f: f[0])
 
             # Crisp technical drawing pen for outlines and seams
-            edge_pen = QPen(QColor("#242424"), max(1.0, 1.2 * ui_scale))
+            edge_color = QColor("#0f172a") if self.outline_mode else QColor("#242424")
+            edge_width = max(1.2, 1.8 * ui_scale) if self.outline_mode else max(1.0, 1.2 * ui_scale)
+            edge_pen = QPen(edge_color, edge_width)
             edge_pen.setJoinStyle(Qt.RoundJoin)
 
             for _depth, pts, col in faces_to_render:
@@ -4953,8 +4963,21 @@ if QT_AVAILABLE:
 
             self.callouts_chk = QCheckBox("Callouts (A, B...)")
             self.callouts_chk.setChecked(True)
+            self.callouts_chk.setToolTip("Toggle callout balloons (A, B, C...) on parts.")
             self.callouts_chk.toggled.connect(self._toggle_callouts)
             exp_toolbar.addWidget(self.callouts_chk)
+
+            self.legend_chk = QCheckBox("Table List")
+            self.legend_chk.setChecked(True)
+            self.legend_chk.setToolTip("Toggle parts legend table on/off to prevent blocking the drawing view.")
+            self.legend_chk.toggled.connect(self._toggle_legend)
+            exp_toolbar.addWidget(self.legend_chk)
+
+            self.outline_chk = QCheckBox("Outline Mode")
+            self.outline_chk.setChecked(False)
+            self.outline_chk.setToolTip("Switch to non-materialized technical outline mode (clean black-and-white line drawing without materials).")
+            self.outline_chk.toggled.connect(self._toggle_outline_mode)
+            exp_toolbar.addWidget(self.outline_chk)
 
             exp_toolbar.addStretch(1)
 
@@ -5405,6 +5428,14 @@ if QT_AVAILABLE:
 
         def _toggle_callouts(self, checked: bool) -> None:
             self.drawing_widget.show_callouts = checked
+            self.drawing_widget.update()
+
+        def _toggle_legend(self, checked: bool) -> None:
+            self.drawing_widget.show_legend = checked
+            self.drawing_widget.update()
+
+        def _toggle_outline_mode(self, checked: bool) -> None:
+            self.drawing_widget.outline_mode = checked
             self.drawing_widget.update()
 
         # -------------------------------------------------------------------

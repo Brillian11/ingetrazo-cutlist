@@ -817,6 +817,27 @@ class TestCutListPlugin(unittest.TestCase):
         # 3. generate_all re-reads selection from workspace on click
         self.assertIn("def generate_all(self) -> None:\n            self._load_selection()", src)
 
+    def test_exploded_drawing_table_toggle_and_outline_mode(self):
+        """Verify options to toggle parts table on/off and switch to non-materialized outline mode."""
+        plugin_path = Path(__file__).parent.parent / "cutlist_plugin.py"
+        with open(plugin_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # 1. Verify checkboxes and handlers in toolbar
+        self.assertIn("self.legend_chk = QCheckBox(\"Table List\")", src)
+        self.assertIn("self.legend_chk.toggled.connect(self._toggle_legend)", src)
+        self.assertIn("self.outline_chk = QCheckBox(\"Outline Mode\")", src)
+        self.assertIn("self.outline_chk.toggled.connect(self._toggle_outline_mode)", src)
+
+        # 2. Verify drawing widget attributes and logic
+        self.assertIn("self.show_legend = True", src)
+        self.assertIn("self.outline_mode = False", src)
+        self.assertIn("if not self.outline_mode and self._cached_image", src)
+
+        # 3. Verify non-materialized white face / dark outline logic in fallback renderer
+        self.assertIn("if self.outline_mode:\n                    base_color = QColor(\"#ffffff\")", src)
+        self.assertIn("if self.outline_mode:\n                        shaded_color = QColor(\"#ffffff\")", src)
+
 
 if __name__ == "__main__":
     unittest.main()
