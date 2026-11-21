@@ -4847,6 +4847,11 @@ if QT_AVAILABLE:
             self.save_draw_pdf_btn.clicked.connect(self._export_drawing_pdf)
             exp_toolbar.addWidget(self.save_draw_pdf_btn)
 
+            self.export_composer_btn = QPushButton("📐 Export to Composer...")
+            self.export_composer_btn.setToolTip("Export high-resolution exploded drawing directly into IngeTrazo Sheet Composer.")
+            self.export_composer_btn.clicked.connect(self._export_to_composer)
+            exp_toolbar.addWidget(self.export_composer_btn)
+
             te_layout.addLayout(exp_toolbar)
 
             self.drawing_widget = ExplodedDrawingWidget(viewport=self.viewport, parent=self)
@@ -5091,28 +5096,8 @@ if QT_AVAILABLE:
             self.tabs.currentChanged.connect(self._on_tab_changed)
             main_layout.addWidget(self.tabs, stretch=1)
 
-            # Bottom Bar with About & Close Buttons
+            # Bottom Bar with Close Button
             bottom_box = QHBoxLayout()
-            about_link_btn = QPushButton("ℹ About OpenCutList")
-            about_link_btn.setToolTip("Woodworker & cabinet maker extension details, developer credits")
-            about_link_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: transparent;
-                    color: #94a3b8;
-                    border: 1px solid #475569;
-                    border-radius: 4px;
-                    padding: 4px 12px;
-                    font-size: 11px;
-                }
-                QPushButton:hover {
-                    color: #38bdf8;
-                    border-color: #38bdf8;
-                    background-color: #1e293b;
-                }
-            """)
-            about_link_btn.clicked.connect(self._show_about_dialog)
-            bottom_box.addWidget(about_link_btn)
-
             bottom_box.addStretch(1)
             close_btn = QPushButton("Close")
             close_btn.clicked.connect(self.accept)
@@ -6222,6 +6207,115 @@ if QT_AVAILABLE:
                     QMessageBox.information(self, "Complete", f"Exploded drawing PDF saved to:\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export PDF:\n{e}")
+
+        def _export_to_composer(self) -> None:
+            """Exports high-resolution exploded technical drawing directly into IngeTrazo Sheet Composer."""
+            doc_name = get_project_name(self.viewport)
+            clean_name = re.sub(r'[^\w\-_\.]', '_', doc_name) if doc_name else "exploded_assembly"
+            default_filename = f"{clean_name}_exploded_drawing.png"
+
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Exploded Drawing to IngeTrazo Composer",
+                default_filename,
+                "PNG Images (*.png)"
+            )
+            if not path:
+                return
+
+            try:
+                # 1. Render high-res drawing with title, exploded 3D model, callout balloons, and parts legend
+                w, h = 2400, 1600
+                pix = QPixmap(w, h)
+                pix.fill(Qt.transparent)
+                p = QPainter(pix)
+                self.drawing_widget.render_drawing(p, QRectF(0, 0, w, h))
+                p.end()
+                pix.save(path, "PNG")
+
+                # 2. Locate IngeTrazo MainWindow
+                main_win = None
+                if hasattr(self, "viewport") and self.viewport is not None:
+                    if hasattr(self.viewport, "window"):
+                        main_win = self.viewport.window()
+                    elif hasattr(self.viewport, "parent") and self.viewport.parent():
+                        p_widget = self.viewport.parent()
+                        if hasattr(p_widget, "window"):
+                            main_win = p_widget.window()
+
+                if not main_win and QT_AVAILABLE:
+                    for widget in QApplication.topLevelWidgets():
+                        if widget.__class__.__name__ == "MainWindow" or hasattr(widget, "_ensure_composer") or hasattr(widget, "_on_open_composer"):
+                            main_win = widget
+                            break
+
+                composer = None
+                if main_win is not None:
+                    # Open or raise Sheet Composer
+                    if hasattr(main_win, "_on_open_composer"):
+                        main_win._on_open_composer()
+                    elif hasattr(main_win, "_ensure_composer"):
+                        main_win._ensure_composer()
+
+                    composer = getattr(main_win, "_composer", None)
+                    if not composer and hasattr(main_win, "_ensure_composer"):
+                        composer = main_win._ensure_composer()
+
+                # 3. Insert drawing onto Composer Sheet
+                inserted = False
+                if composer is not None:
+                    try:
+                        # Ensure a sheet exists
+                        if not getattr(composer, "comp", None) and hasattr(composer, "_new_sheet_tab"):
+                            composer._new_sheet_tab()
+
+                        # Try to import AddItemCommand and ImagenItem from views.composer
+                        from views.composer import AddItemCommand, ImagenItem
+                        comp = getattr(composer, "comp", None)
+                        margin = getattr(comp, "margin_mm", [15.0, 15.0, 15.0, 15.0]) if comp else [15.0, 15.0, 15.0, 15.0]
+                        x_mm = float(margin[0] if isinstance(margin, (list, tuple)) else 15.0)
+                        y_mm = float(margin[1] if isinstance(margin, (list, tuple)) else 15.0)
+                        z = composer._next_z() if hasattr(composer, "_next_z") else 1
+                        # Drawing item size (landscape A4 printable area ~260 x 173 mm)
+                        w_mm = 260.0
+                        h_mm = 173.3
+                        item = ImagenItem(x_mm, y_mm, w_mm, h_mm, path, z)
+                        if hasattr(composer, "history") and hasattr(composer.history, "execute"):
+                            composer.history.execute(AddItemCommand(composer.comp, item))
+                            inserted = True
+                        elif hasattr(comp, "items"):
+                            comp.items.append(item)
+                            inserted = True
+
+                        if hasattr(composer, "zoom_fit_page"):
+                            composer.zoom_fit_page()
+                        if hasattr(composer, "raise_"):
+                            composer.raise_()
+                    except Exception as err:
+                        sys.stderr.write(f"[CutList] Note on inserting into composer: {err}\\n")
+
+                if inserted:
+                    QMessageBox.information(
+                        self,
+                        "IngeTrazo Composer",
+                        f"Exploded assembly drawing exported and placed onto the active sheet in IngeTrazo Composer!\\n\\nImage saved to:\\n{path}"
+                    )
+                elif composer is not None:
+                    if hasattr(composer, "raise_"):
+                        composer.raise_()
+                    QMessageBox.information(
+                        self,
+                        "IngeTrazo Composer",
+                        f"Exploded drawing saved to:\\n{path}\\n\\nIngeTrazo Composer is open. You can place or reposition this drawing using: Insert ▸ Image."
+                    )
+                else:
+                    QMessageBox.information(
+                        self,
+                        "Export Complete",
+                        f"Exploded drawing saved to:\\n{path}\\n\\nYou can now place this drawing in IngeTrazo Sheet Composer."
+                    )
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export drawing to IngeTrazo Composer:\\n{e}")
 
         # -------------------------------------------------------------------
         # Cost & Weight Estimator Methods

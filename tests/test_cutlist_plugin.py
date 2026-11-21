@@ -756,6 +756,26 @@ class TestCutListPlugin(unittest.TestCase):
             self.assertIn("GRAND TOTAL QUOTE", content)
             self.assertIn("Pine", content)
 
+    def test_export_to_composer_and_bottom_bar(self):
+        """Verify export to IngeTrazo Composer button and absence of about button in bottom bar."""
+        # 1. Source verification (works in headless test environments)
+        plugin_path = Path(__file__).parent.parent / "cutlist_plugin.py"
+        with open(plugin_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        self.assertIn("self.export_composer_btn = QPushButton", src)
+        self.assertIn("Export to Composer", src)
+        self.assertIn("def _export_to_composer", src)
+        self.assertIn("self._export_to_composer", src)
+
+        # 2. Verify about button is NOT in the bottom bar of CutListWindow
+        self.assertNotIn("about_link_btn = QPushButton", src)
+        self.assertNotIn("about_link_btn.clicked.connect", src)
+
+        # 3. If Qt is available in environment, verify class attribute
+        if cp.QT_AVAILABLE:
+            self.assertTrue(hasattr(cp.CutListWindow, "_export_to_composer"))
+
 
 if __name__ == "__main__":
     unittest.main()
