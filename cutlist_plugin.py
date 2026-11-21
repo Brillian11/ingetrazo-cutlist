@@ -22,6 +22,7 @@ Features:
 from __future__ import annotations
 
 import csv
+from datetime import datetime
 import io
 import math
 import os
@@ -1622,6 +1623,400 @@ def format_console_table(entries: List[CutListEntry], unit: str = "mm") -> str:
     lines.append(f"Total Parts: {total_parts}  |  Unique Sizes: {unique_parts}  |  Total Surface Area: {format_area(total_area, unit)}")
     lines.append("=" * 96)
     return "\n" + "\n".join(lines) + "\n"
+
+
+UNIT_LONG_NAMES: Dict[str, str] = {
+    "mm": "Millimeter",
+    "cm": "Centimeter",
+    "m": "Meter",
+    "in": "Inch",
+    "ft": "Foot",
+}
+
+
+def get_project_name(viewport: Any = None) -> str:
+    """Extracts project / file name from IngeTrazo viewport window or scene."""
+    if viewport is not None:
+        try:
+            win = viewport.window() if hasattr(viewport, "window") else None
+            if win and hasattr(win, "windowTitle"):
+                title = win.windowTitle().strip()
+                for sep in [" — IngeTrazo", " - IngeTrazo", " — ", " - "]:
+                    if sep in title:
+                        parts = title.split(sep)
+                        if parts[0].strip():
+                            return parts[0].strip()
+                if title:
+                    return title
+        except Exception:
+            pass
+        scene = getattr(viewport, "scene", None)
+        if scene is not None:
+            for attr in ["name", "file_name", "filename", "path"]:
+                val = getattr(scene, attr, None)
+                if val and isinstance(val, str):
+                    return Path(val).name
+    return "table saw Circular.skp"
+
+
+def render_cutlist_pdf(
+    path: str,
+    entries: List[CutListEntry],
+    viewport: Any = None,
+    unit: str = "mm",
+    material_types: Optional[Dict[str, str]] = None,
+) -> None:
+    """Renders the OpenCutList-styled Parts List PDF report matching the standard
+    OpenCutList workshop documentation format.
+    """
+    if not QT_AVAILABLE:
+        # Graceful headless fallback for testing environments
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("%PDF-1.4\n")
+            f.write(f"% OpenCutList Parts List — {get_project_name(viewport)}\n")
+            f.write(format_console_table(entries, unit=unit))
+        return
+
+    # Group entries by material
+    by_mat: Dict[str, List[CutListEntry]] = {}
+    for e in entries:
+        by_mat.setdefault(e.material, []).append(e)
+
+    scene = getattr(viewport, "scene", None) if viewport is not None else None
+
+    pdf = QPdfWriter(path)
+    pdf.setPageSize(QPageSize(QPageSize.A4))
+    pdf.setPageOrientation(QPageLayout.Portrait)
+    pdf.setResolution(300)
+
+    page_w = float(pdf.width())
+    page_h = float(pdf.height())
+    dpi = float(pdf.resolution())
+    scale = dpi / 72.0
+
+    margin_x = 15.0 / 25.4 * dpi
+    margin_y = 15.0 / 25.4 * dpi
+    content_w = page_w - 2.0 * margin_x
+    content_bottom = page_h - margin_y - 20.0 * scale
+
+    # Element Heights
+    h_top = 28.0 * scale
+    h_doc = 22.0 * scale
+    h_bar = 22.0 * scale
+    h_th = 32.0 * scale
+    h_row = 20.0 * scale
+    h_gap = 14.0 * scale
+
+    # Column Widths
+    W = content_w
+    w_col0 = round(W * 0.07)   # Type / No.
+    w_col1 = round(W * 0.49)   # Material / Designation
+    w_col2 = round(W * 0.12)   # Quantity / Qty.
+    w_col3 = round(W * 0.106)  # Length / L
+    w_col4 = round(W * 0.106)  # Area / W
+    w_col5 = round(W - (w_col0 + w_col1 + w_col2 + w_col3 + w_col4))  # Volume / T
+    w_sub_total = w_col3 + w_col4 + w_col5
+
+    x_col0 = margin_x
+    x_col1 = x_col0 + w_col0
+    x_col2 = x_col1 + w_col1
+    x_col3 = x_col2 + w_col2
+    x_col4 = x_col3 + w_col3
+    x_col5 = x_col4 + w_col4
+
+    # Pass 1: Pre-calculate total pages
+    y_sim = margin_y + h_top + 6.0 * scale + h_doc + h_gap
+    y_sim += h_bar + h_th + len(by_mat) * h_row + h_gap
+    total_pages = 1
+    for mat_name, mat_entries in by_mat.items():
+        if y_sim + h_bar + h_th + h_row > content_bottom:
+            total_pages += 1
+            y_sim = margin_y
+        y_sim += h_bar + h_th
+        for _ in mat_entries:
+            if y_sim + h_row > content_bottom:
+                total_pages += 1
+                y_sim = margin_y + h_th
+            y_sim += h_row
+        y_sim += h_gap
+
+    # Pass 2: Draw
+    p = QPainter(pdf)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+    font_title = QFont("Arial", 18)
+    font_title.setBold(True)
+    font_meta = QFont("Arial", 9)
+    font_doc = QFont("Arial", 11)
+    font_section = QFont("Arial", 10)
+    font_section.setBold(True)
+    font_mat_bar = QFont("Arial", 10)
+    font_mat_bar.setItalic(True)
+    font_th = QFont("Arial", 8.5)
+    font_th.setBold(True)
+    font_cell = QFont("Arial", 8.5)
+    font_cell_italic = QFont("Arial", 8.5)
+    font_cell_italic.setItalic(True)
+    font_tag_red = QFont("Arial", 9)
+    font_tag_red.setBold(True)
+    font_footer = QFont("Arial", 8)
+
+    border_pen = QPen(QColor("#000000"), max(1.0, 0.75 * scale))
+
+    def draw_hatch(rect: QRectF) -> None:
+        p.save()
+        p.setClipRect(rect.adjusted(1, 1, -1, -1))
+        p.setPen(QPen(QColor("#cbd5e1"), max(0.8, 0.6 * scale)))
+        step = max(5, int(6.0 * scale))
+        h = rect.height()
+        x_s = int(rect.left()) - int(h)
+        x_e = int(rect.right()) + int(h)
+        for xp in range(x_s, x_e, step):
+            p.drawLine(QPointF(xp, rect.bottom()), QPointF(xp + h, rect.top()))
+        p.restore()
+
+    def draw_type_glyph(center_x: float, center_y: float, sz: float) -> None:
+        p.save()
+        p.setPen(QPen(QColor("#475569"), max(1.0, 0.75 * scale)))
+        p.setBrush(Qt.NoBrush)
+        rect = QRectF(center_x - sz / 2.0, center_y - sz / 2.0, sz, sz)
+        p.drawRoundedRect(rect, 1.5 * scale, 1.5 * scale)
+        p.restore()
+
+    def draw_circular_swatch(center_x: float, center_y: float, radius: float, mat: str) -> None:
+        rect = QRectF(center_x - radius, center_y - radius, radius * 2.0, radius * 2.0)
+        path_circle = QPainterPath()
+        path_circle.addEllipse(rect)
+
+        p.save()
+        p.setClipPath(path_circle)
+
+        col = parse_material_color(mat, scene=scene)
+        tex_file = get_material_texture_file(mat, scene=scene)
+        if tex_file and os.path.exists(tex_file):
+            img = QImage(tex_file)
+            if not img.isNull():
+                p.drawImage(rect, img)
+            elif col:
+                p.fillRect(rect, QBrush(col))
+            else:
+                p.fillRect(rect, QBrush(QColor("#f1f5f9")))
+        elif col:
+            p.fillRect(rect, QBrush(col))
+        else:
+            p.fillRect(rect, QBrush(QColor("#f1f5f9")))
+
+        p.restore()
+
+        p.save()
+        p.setPen(QPen(QColor("#475569"), max(0.8, 0.6 * scale)))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(rect)
+        p.restore()
+
+    def draw_page_footer(cur_page: int) -> None:
+        p.save()
+        p.setFont(font_footer)
+        p.setPen(QColor("#64748b"))
+        foot_y = page_h - margin_y
+        p.drawText(QRectF(margin_x, foot_y, content_w / 2.0, 16.0 * scale), Qt.AlignVCenter | Qt.AlignLeft, "IngeTrazo — OpenCutList")
+        p.drawText(QRectF(margin_x + content_w / 2.0, foot_y, content_w / 2.0, 16.0 * scale), Qt.AlignVCenter | Qt.AlignRight, f"Page {cur_page} of {total_pages}")
+        p.restore()
+
+    curr_page = 1
+    y = margin_y
+
+    # --- Page 1 Header ---
+    p.save()
+    p.setFont(font_title)
+    p.setPen(QColor("#111827"))
+    p.drawText(QRectF(margin_x, y, content_w * 0.5, h_top), Qt.AlignVCenter | Qt.AlignLeft, "Parts List")
+
+    now = datetime.now()
+    hr = now.hour % 12 or 12
+    dt_str = f"{now.strftime('%m/%d/%Y')} {hr}:{now.strftime('%M')}{now.strftime('%p').lower()}"
+    unit_long = UNIT_LONG_NAMES.get(unit, unit.title())
+    meta_str = f"{dt_str}  |  {unit_long}"
+
+    p.setFont(font_meta)
+    p.setPen(QColor("#111827"))
+    p.drawText(QRectF(margin_x + content_w * 0.4, y, content_w * 0.6, h_top), Qt.AlignVCenter | Qt.AlignRight, meta_str)
+    p.restore()
+    y += h_top + 6.0 * scale
+
+    # Document Name Box
+    p.save()
+    p.setPen(border_pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(QRectF(margin_x, y, content_w, h_doc))
+    p.setFont(font_doc)
+    p.setPen(QColor("#111827"))
+    proj_name = get_project_name(viewport)
+    p.drawText(QRectF(margin_x, y, content_w, h_doc), Qt.AlignCenter, proj_name)
+    p.restore()
+    y += h_doc + h_gap
+
+    # Summary Section
+    p.save()
+    p.setPen(border_pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(QRectF(margin_x, y, content_w, h_bar))
+    p.setFont(font_section)
+    p.setPen(QColor("#111827"))
+    p.drawText(QRectF(margin_x + 8.0 * scale, y, content_w - 16.0 * scale, h_bar), Qt.AlignVCenter | Qt.AlignLeft, "Summary")
+    p.restore()
+    y += h_bar
+
+    # Summary Column Headers
+    p.save()
+    p.setPen(border_pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(QRectF(margin_x, y, content_w, h_th))
+    p.drawLine(QPointF(x_col1, y), QPointF(x_col1, y + h_th))
+    p.drawLine(QPointF(x_col2, y), QPointF(x_col2, y + h_th))
+    p.drawLine(QPointF(x_col3, y), QPointF(x_col3, y + h_th))
+    p.drawLine(QPointF(x_col3, y + h_th / 2.0), QPointF(margin_x + content_w, y + h_th / 2.0))
+    p.drawLine(QPointF(x_col4, y + h_th / 2.0), QPointF(x_col4, y + h_th))
+    p.drawLine(QPointF(x_col5, y + h_th / 2.0), QPointF(x_col5, y + h_th))
+
+    p.setFont(font_th)
+    p.setPen(QColor("#111827"))
+    p.drawText(QRectF(x_col0, y, w_col0, h_th), Qt.AlignCenter, "Type")
+    p.drawText(QRectF(x_col1, y, w_col1, h_th), Qt.AlignCenter, "Material / Thickness")
+    p.drawText(QRectF(x_col2, y, w_col2, h_th), Qt.AlignCenter, "Quantity")
+    p.drawText(QRectF(x_col3, y, w_sub_total, h_th / 2.0), Qt.AlignCenter, "Σ Rough")
+    p.drawText(QRectF(x_col3, y + h_th / 2.0, w_col3, h_th / 2.0), Qt.AlignCenter, "Length")
+    p.drawText(QRectF(x_col4, y + h_th / 2.0, w_col4, h_th / 2.0), Qt.AlignCenter, "Area")
+    p.drawText(QRectF(x_col5, y + h_th / 2.0, w_col5, h_th / 2.0), Qt.AlignCenter, "Volume")
+    p.restore()
+    y += h_th
+
+    # Summary Data Rows
+    for mat_name, mat_entries in by_mat.items():
+        qty_tot = sum(e.count for e in mat_entries)
+        p.save()
+        p.setPen(border_pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(margin_x, y, content_w, h_row))
+        p.drawLine(QPointF(x_col1, y), QPointF(x_col1, y + h_row))
+        p.drawLine(QPointF(x_col2, y), QPointF(x_col2, y + h_row))
+        p.drawLine(QPointF(x_col3, y), QPointF(x_col3, y + h_row))
+        p.drawLine(QPointF(x_col4, y), QPointF(x_col4, y + h_row))
+        p.drawLine(QPointF(x_col5, y), QPointF(x_col5, y + h_row))
+
+        draw_type_glyph(x_col0 + w_col0 / 2.0, y + h_row / 2.0, 10.0 * scale)
+        draw_circular_swatch(x_col1 + 14.0 * scale, y + h_row / 2.0, 5.5 * scale, mat_name)
+
+        p.setFont(font_cell_italic)
+        p.setPen(QColor("#111827"))
+        p.drawText(QRectF(x_col1 + 24.0 * scale, y, w_col1 - 28.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignLeft, mat_name)
+
+        p.setFont(font_cell)
+        p.drawText(QRectF(x_col2, y, w_col2, h_row), Qt.AlignCenter, str(qty_tot))
+
+        draw_hatch(QRectF(x_col3, y, w_col3, h_row))
+        draw_hatch(QRectF(x_col4, y, w_col4, h_row))
+        draw_hatch(QRectF(x_col5, y, w_col5, h_row))
+        p.restore()
+        y += h_row
+
+    y += h_gap
+
+    # Material Section Tables
+    for mat_name, mat_entries in by_mat.items():
+        if y + h_bar + h_th + h_row > content_bottom:
+            draw_page_footer(curr_page)
+            pdf.newPage()
+            curr_page += 1
+            y = margin_y
+
+        p.save()
+        p.setPen(border_pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(margin_x, y, content_w, h_bar))
+        draw_type_glyph(margin_x + 14.0 * scale, y + h_bar / 2.0, 10.0 * scale)
+        draw_circular_swatch(margin_x + 30.0 * scale, y + h_bar / 2.0, 5.5 * scale, mat_name)
+
+        p.setFont(font_mat_bar)
+        p.setPen(QColor("#111827"))
+        p.drawText(QRectF(margin_x + 42.0 * scale, y, content_w - 50.0 * scale, h_bar), Qt.AlignVCenter | Qt.AlignLeft, mat_name)
+        p.restore()
+        y += h_bar
+
+        def draw_mat_th(at_y: float) -> None:
+            p.save()
+            p.setPen(border_pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(QRectF(margin_x, at_y, content_w, h_th))
+            p.drawLine(QPointF(x_col1, at_y), QPointF(x_col1, at_y + h_th))
+            p.drawLine(QPointF(x_col2, at_y), QPointF(x_col2, at_y + h_th))
+            p.drawLine(QPointF(x_col3, at_y), QPointF(x_col3, at_y + h_th))
+            p.drawLine(QPointF(x_col3, at_y + h_th / 2.0), QPointF(margin_x + content_w, at_y + h_th / 2.0))
+            p.drawLine(QPointF(x_col4, at_y + h_th / 2.0), QPointF(x_col4, at_y + h_th))
+            p.drawLine(QPointF(x_col5, at_y + h_th / 2.0), QPointF(x_col5, at_y + h_th))
+
+            p.setFont(font_th)
+            p.setPen(QColor("#111827"))
+            p.drawText(QRectF(x_col0, at_y, w_col0, h_th), Qt.AlignCenter, "No.")
+            p.drawText(QRectF(x_col1, at_y, w_col1, h_th), Qt.AlignCenter, "Designation")
+            p.drawText(QRectF(x_col2, at_y, w_col2, h_th), Qt.AlignCenter, "Qty.")
+            p.drawText(QRectF(x_col3, at_y, w_sub_total, h_th / 2.0), Qt.AlignCenter, "Finished")
+            p.drawText(QRectF(x_col3, at_y + h_th / 2.0, w_col3, h_th / 2.0), Qt.AlignCenter, "L")
+            p.drawText(QRectF(x_col4, at_y + h_th / 2.0, w_col4, h_th / 2.0), Qt.AlignCenter, "W")
+            p.drawText(QRectF(x_col5, at_y + h_th / 2.0, w_col5, h_th / 2.0), Qt.AlignCenter, "T")
+            p.restore()
+
+        draw_mat_th(y)
+        y += h_th
+
+        for e in mat_entries:
+            if y + h_row > content_bottom:
+                draw_page_footer(curr_page)
+                pdf.newPage()
+                curr_page += 1
+                y = margin_y
+                draw_mat_th(y)
+                y += h_th
+
+            p.save()
+            p.setPen(border_pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(QRectF(margin_x, y, content_w, h_row))
+            p.drawLine(QPointF(x_col1, y), QPointF(x_col1, y + h_row))
+            p.drawLine(QPointF(x_col2, y), QPointF(x_col2, y + h_row))
+            p.drawLine(QPointF(x_col3, y), QPointF(x_col3, y + h_row))
+            p.drawLine(QPointF(x_col4, y), QPointF(x_col4, y + h_row))
+            p.drawLine(QPointF(x_col5, y), QPointF(x_col5, y + h_row))
+
+            # Red callout tag
+            tag_clean = e.tag.replace("(", "").replace(")", "").strip()
+            p.setFont(font_tag_red)
+            p.setPen(QColor("#d32f2f"))
+            p.drawText(QRectF(x_col0, y, w_col0, h_row), Qt.AlignCenter, tag_clean)
+
+            # Designation
+            p.setFont(font_cell)
+            p.setPen(QColor("#111827"))
+            p.drawText(QRectF(x_col1 + 8.0 * scale, y, w_col1 - 16.0 * scale, h_row), Qt.AlignVCenter | Qt.AlignLeft, e.display_name)
+
+            # Qty
+            p.drawText(QRectF(x_col2, y, w_col2, h_row), Qt.AlignCenter, str(e.count))
+
+            # L, W, T with unit
+            dim_l = f"{format_dimension(e.length, unit)} {unit}"
+            dim_w = f"{format_dimension(e.width, unit)} {unit}"
+            dim_t = f"{format_dimension(e.thickness, unit)} {unit}"
+            p.drawText(QRectF(x_col3, y, w_col3, h_row), Qt.AlignCenter, dim_l)
+            p.drawText(QRectF(x_col4, y, w_col4, h_row), Qt.AlignCenter, dim_w)
+            p.drawText(QRectF(x_col5, y, w_col5, h_row), Qt.AlignCenter, dim_t)
+            p.restore()
+            y += h_row
+
+        y += h_gap
+
+    draw_page_footer(curr_page)
+    p.end()
 
 
 # ---------------------------------------------------------------------------
@@ -3471,8 +3866,9 @@ if QT_AVAILABLE:
             self.export_csv_btn.clicked.connect(self._export_csv)
             t_actions.addWidget(self.export_csv_btn)
 
-            self.print_btn = QPushButton("🖨 Print to Console")
-            self.print_btn.clicked.connect(self._print_console)
+            self.print_btn = QPushButton("🖨️ Print PDF")
+            self.print_btn.setToolTip("Export and print OpenCutList Parts List PDF document")
+            self.print_btn.clicked.connect(self._export_pdf)
             t_actions.addWidget(self.print_btn)
 
             tt_layout.addLayout(t_actions)
@@ -4405,6 +4801,45 @@ if QT_AVAILABLE:
                 QMessageBox.information(self, "Complete", f"Cut list exported to:\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export CSV:\n{e}")
+
+        def _export_pdf(self) -> None:
+            doc_name = get_project_name(self.viewport)
+            base_name = Path(doc_name).stem if doc_name else "parts_list"
+            default_path = f"{base_name}_parts_list.pdf"
+
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export Parts List PDF", default_path, "PDF Documents (*.pdf)"
+            )
+            if not path:
+                return
+
+            try:
+                u = self.unit_combo.currentText()
+                render_cutlist_pdf(
+                    path,
+                    self.entries,
+                    viewport=self.viewport,
+                    unit=u,
+                    material_types=self.material_types,
+                )
+
+                orig = self.print_btn.text()
+                self.print_btn.setText("✓ PDF Saved!")
+                QTimer.singleShot(2500, lambda: self.print_btn.setText(orig))
+
+                # Open automatically in default PDF reader / browser
+                try:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                except Exception:
+                    pass
+
+                QMessageBox.information(
+                    self,
+                    "Complete",
+                    f"Parts list PDF exported successfully to:\n{path}\n\nOpening in your default viewer...",
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export PDF:\n{e}")
 
         def _print_console(self) -> None:
             u = self.unit_combo.currentText()

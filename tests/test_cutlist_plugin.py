@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 IngeTrazo Extension Developer
 """Unit tests for the OpenCutList plugin for IngeTrazo (v1.4.0)."""
+import os
 import unittest
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
@@ -514,6 +515,27 @@ class TestCutListPlugin(unittest.TestCase):
         self.assertEqual(items[0].category_name, "⭐ In Model")
         self.assertEqual(items[1].name, "metal_brushed")
         self.assertEqual(items[2].name, "Poplar")
+
+    def test_render_cutlist_pdf_and_metadata(self):
+        """Verify OpenCutList-styled PDF export generation and metadata mappings."""
+        self.assertEqual(cp.UNIT_LONG_NAMES.get("mm"), "Millimeter")
+        self.assertEqual(cp.UNIT_LONG_NAMES.get("cm"), "Centimeter")
+        self.assertEqual(cp.UNIT_LONG_NAMES.get("in"), "Inch")
+
+        self.assertTrue(cp.get_project_name(None).endswith(".skp"))
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = os.path.join(tmpdir, "test_parts_list.pdf")
+            entries = [
+                cp.CutListEntry("A", "Component#33", 1, 0.065, 0.012, 0.012, "0128_White"),
+                cp.CutListEntry("B", "Component#34", 1, 0.065, 0.012, 0.012, "0128_White"),
+                cp.CutListEntry("C", "rod", 1, 0.065, 0.012, 0.012, "0128_White"),
+                cp.CutListEntry("D", "Brace", 2, 0.800, 0.050, 0.020, "Pine woods"),
+            ]
+            cp.render_cutlist_pdf(pdf_path, entries, unit="cm")
+            self.assertTrue(os.path.exists(pdf_path))
+            self.assertGreater(os.path.getsize(pdf_path), 50)
 
 
 if __name__ == "__main__":
